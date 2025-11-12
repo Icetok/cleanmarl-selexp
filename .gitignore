@@ -9,6 +9,11 @@
 /runs_hpc
 /wandb
 /smaclite
+/JaxMARL
 /.DS_Store
 /.vscode
 todo.txt
+cleanmarl/env/smax_vec_wrapper.py
+cleanmarl/env/smax_wrapper.py
+cleanmarl/mappo_smax.py
+cleanmarl/vdn_jaxenvs.py

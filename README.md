@@ -2,7 +2,8 @@
 
 **CleanMARL** provides single-file, clean, and educational implementations of Deep Multi-Agent Reinforcement Learning (MARL) algorithms in PyTorch, following the same philosophy of [CleanRL](https://github.com/vwxyzjn/cleanrl).
 
-### Main Features:
+### Main Features
+
 * Implementations of key MARL algorithms: VDN, QMIX, COMA, MADDPG, FACMAC, IPPO, and MAPPO.
 
 * A documentation for algorithms, code and training details.
@@ -14,6 +15,7 @@
 We provide more details in our [documentation](https://cleanmarl-docs.readthedocs.io/en/latest/).
 
 You can find runs in Weights & Biases: [Weights & Biases](https://api.wandb.ai/links/andamamine-cleanmarl/b6a74ca6)
+
 ## Quick Start
 
 Prerequisites:
@@ -36,6 +38,14 @@ python  cleanmarl/vdn.py --env_type="pz" --env_name="simple_spread_v3" --env_fam
 python  cleanmarl/mappo.py --env_type="smaclite" --env_name="3m" 
 ```
 
+## To do next
+
+* Save the checkpoints.
+* Support continuous actions (MAPPO, IPPO, MADDPG, FACMAC).
+* Support individual rewards.
+* Support Jax-based environments (Jaxmarl ..).
+* Fully Jitted training for Jax-based environments.
+
 ## Algorithms Implemented
 
 | Algorithm | Variants Implemented |
@@ -47,11 +57,3 @@ python  cleanmarl/mappo.py --env_type="smaclite" --env_name="3m"
 | [Factored Multi-Agent Centralized Policy Gradients (FACMAC)](https://arxiv.org/abs/2003.06709) | [`facmac.py`](https://github.com/AmineAndam04/cleanmarl/blob/main/cleanmarl/facmac.py) <br> [`facmac_multienvs.py`](https://github.com/AmineAndam04/cleanmarl/blob/main/cleanmarl/facmac_multienvs.py)|
 | [Independent Proximal Policy Optimization (IPPO)](https://arxiv.org/abs/2011.09533) | [`ippo.py`](https://github.com/AmineAndam04/cleanmarl/blob/main/cleanmarl/ippo.py) <br> [`ippo_lstm.py`](https://github.com/AmineAndam04/cleanmarl/blob/main/cleanmarl/ippo_lstm.py) <br> [`ippo_multienvs.py`](https://github.com/AmineAndam04/cleanmarl/blob/main/cleanmarl/ippo_multienvs.py) <br> [`ippo_lstm_multienvs.py`](https://github.com/AmineAndam04/cleanmarl/blob/main/cleanmarl/ippo_lstm_multienvs.py) |
 |  [Multi-Agent Proximal Policy Optimization (MAPPO)](https://arxiv.org/abs/2103.01955) | [`mappo.py`](https://github.com/AmineAndam04/cleanmarl/blob/main/cleanmarl/mappo.py) <br> [`mappo_lstm.py`](https://github.com/AmineAndam04/cleanmarl/blob/main/cleanmarl/mappo_lstm.py) <br> [`mappo_multienvs.py`](https://github.com/AmineAndam04/cleanmarl/blob/main/cleanmarl/mappo_multienvs.py) <br> [`mappo_lstm_multienvs.py`](https://github.com/AmineAndam04/cleanmarl/blob/main/cleanmarl/mappo_lstm_multienvs.py) |
-
-
-
-## To do next:
-
-* Support GPU and MPS training
-* Save the weights 
-

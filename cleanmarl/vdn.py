@@ -16,11 +16,11 @@ from torch.utils.tensorboard import SummaryWriter
 
 @dataclass
 class Args:
-    env_type: str = "smaclite"  # "pz"
+    env_type: str = "pz"  # "pz"
     """ Pettingzoo, SMAClite ... """
-    env_name: str = "3m"  # "simple_spread_v3" #"pursuit_v4"
+    env_name: str = "simple_spread_v3"  # "simple_spread_v3" #"pursuit_v4"
     """ Name of the environment """
-    env_family: str = "sisl"
+    env_family: str = "mpe"
     """ Env family when using pz"""
     agent_ids: bool = True
     """ Include id (one-hot vector) at the agent of the observations"""
@@ -274,8 +274,7 @@ if __name__ == "__main__":
                     x=torch.from_numpy(obs).float().to(device),
                     avail_action=torch.from_numpy(avail_action).bool().to(device),
                 )
-            actions = torch.argmax(q_values, dim=-1).cpu()
-
+            actions = torch.argmax(q_values, dim=-1).cpu().numpy()
         next_obs, reward, done, truncated, infos = env.step(actions)
         next_avail_action = env.get_avail_actions()  # We need the next_avail_action to compute the target loss : max of Q(next_state)
 
@@ -370,7 +369,9 @@ if __name__ == "__main__":
                     ).to(device),
                 )
                 actions = torch.argmax(q_values, dim=-1)
-                next_obs_, reward, done, truncated, infos = eval_env.step(actions.cpu())
+                next_obs_, reward, done, truncated, infos = eval_env.step(
+                    actions.cpu().numpy()
+                )
                 current_reward += reward
                 current_ep_length += 1
                 eval_obs = next_obs_

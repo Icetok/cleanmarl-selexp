@@ -388,7 +388,9 @@ if __name__ == "__main__":
                     )
                 else:
                     actions_to_take = torch.argmax(actions, dim=-1)
-            next_obs, reward, done, truncated, infos = env.step(actions_to_take)
+            next_obs, reward, done, truncated, infos = env.step(
+                actions_to_take.cpu().numpy()
+            )
 
             ep_reward += reward
             ep_length += 1
@@ -540,7 +542,7 @@ if __name__ == "__main__":
                         )
                         eval_actions = torch.argmax(logits, dim=-1)
                     next_obs_, reward, done, truncated, infos = eval_env.step(
-                        eval_actions
+                        eval_actions.cpu().numpy()
                     )
                     current_reward += reward
                     current_ep_length += 1

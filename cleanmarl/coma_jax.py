@@ -630,7 +630,7 @@ if __name__ == "__main__":
                     act_key=act_key,
                 )
 
-                next_obs, reward, done, truncated, infos = env.step(actions)
+                next_obs, reward, done, truncated, infos = env.step(np.array(actions))
                 ep_reward += reward
                 ep_length += 1
                 step += 1
@@ -731,7 +731,9 @@ if __name__ == "__main__":
                     eps=0,
                     act_key=act_key,
                 )
-                next_obs_, reward, done, truncated, infos = eval_env.step(actions)
+                next_obs_, reward, done, truncated, infos = eval_env.step(
+                    np.array(actions)
+                )
                 current_reward += reward
                 current_ep_length += 1
                 eval_obs = next_obs_

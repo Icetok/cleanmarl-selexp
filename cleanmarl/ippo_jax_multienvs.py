@@ -688,6 +688,7 @@ if __name__ == "__main__":
                 log_probs = log_probs.squeeze()
             else:
                 log_probs = log_probs.reshape(actions.shape)
+            actions = np.array(actions)
             for i, j in enumerate(alive_envs):
                 ippo_conns[j].send(("step", actions[i]))
             contents = [ippo_conns[i].recv() for i in alive_envs]
@@ -835,7 +836,9 @@ if __name__ == "__main__":
                         jnp.bool_
                     ),
                 )
-                next_obs_, reward, done, truncated, infos = eval_env.step(actions)
+                next_obs_, reward, done, truncated, infos = eval_env.step(
+                    np.array(actions)
+                )
                 current_reward += reward
                 current_ep_length += 1
                 eval_obs = next_obs_

@@ -323,14 +323,16 @@ if __name__ == "__main__":
                         h=h,
                         avail_action=torch.from_numpy(avail_action).bool().to(device),
                     )
+                    actions = actions.cpu().numpy()
+                    log_probs = log_probs.cpu()
                 next_obs, reward, done, truncated, infos = env.step(actions)
                 ep_reward += reward
                 ep_length += 1
                 step += 1
 
                 episode["obs"].append(obs)
-                episode["actions"].append(actions.cpu())
-                episode["log_prob"].append(log_probs.cpu())
+                episode["actions"].append(actions)
+                episode["log_prob"].append(log_probs)
                 episode["reward"].append(reward)
                 episode["done"].append(done)
                 episode["avail_actions"].append(avail_action)
@@ -553,7 +555,9 @@ if __name__ == "__main__":
                         .bool()
                         .to(device),
                     )
-                next_obs_, reward, done, truncated, infos = eval_env.step(actions)
+                next_obs_, reward, done, truncated, infos = eval_env.step(
+                    actions.cpu().numpy()
+                )
                 current_reward += reward
                 current_ep_length += 1
                 eval_obs = next_obs_

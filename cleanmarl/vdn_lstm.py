@@ -311,7 +311,7 @@ if __name__ == "__main__":
         if random.random() < epsilon:
             actions = env.sample()
         else:
-            actions = torch.argmax(q_values, dim=-1).cpu()
+            actions = torch.argmax(q_values, dim=-1).cpu().numpy()
         next_obs, reward, done, truncated, infos = env.step(actions)
         next_avail_action = env.get_avail_actions()  # We need the next_avail_action to compute the target loss : max of Q(next_state)
 
@@ -486,7 +486,7 @@ if __name__ == "__main__":
                         eval_env.get_avail_actions(), dtype=torch.bool, device=device
                     ),
                 )
-                actions = torch.argmax(q_values, dim=-1)
+                actions = torch.argmax(q_values, dim=-1).cpu().numpy()
                 next_obs_, reward, done, truncated, infos = eval_env.step(actions)
                 current_reward += reward
                 current_ep_length += 1

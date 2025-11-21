@@ -18,9 +18,9 @@ from torch.utils.tensorboard import SummaryWriter
 
 @dataclass
 class Args:
-    env_type: str = "smaclite"
+    env_type: str = "pz"
     """ Pettingzoo, SMAClite ... """
-    env_name: str = "3m"
+    env_name: str = "simple_spread_v3"
     """ Name of the environment"""
     env_family: str = "mpe"
     """ Env family when using pz"""
@@ -465,7 +465,7 @@ if __name__ == "__main__":
         )
         if random.random() < epsilon:
             actions = env.sample()
-        next_obs, reward, done, truncated, infos = env.step(actions)
+        next_obs, reward, done, truncated, infos = env.step(np.array(actions))
         next_avail_action = env.get_avail_actions()  # We need the next_avail_action to compute the target loss : max of Q(next_state)
 
         ep_reward += reward
@@ -576,7 +576,9 @@ if __name__ == "__main__":
                     h_eval,
                     jnp.asarray(eval_env.get_avail_actions().astype(jnp.bool)),
                 )
-                next_obs_, reward, done, truncated, infos = eval_env.step(actions)
+                next_obs_, reward, done, truncated, infos = eval_env.step(
+                    np.array(actions)
+                )
                 current_reward += reward
                 current_ep_length += 1
                 eval_obs = next_obs_

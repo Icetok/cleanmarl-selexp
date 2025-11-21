@@ -9,29 +9,27 @@ import torch.optim as optim
 from dataclasses import dataclass
 import torch.nn.functional as F
 from env.pettingzoo_wrapper import PettingZooWrapper
-from env.smaclite_wrapper import SMACliteWrapper
-from env.lbf import LBFWrapper
-from torch.distributions.categorical import Categorical
+from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
 
 
 @dataclass
 class Args:
-    env_type: str = "smaclite"
+    env_type: str = "pz"
     """ Pettingzoo, SMAClite ... """
-    env_name: str = "3m"
+    env_name: str = "multiwalker_v9"
     """ Name of the environment"""
-    env_family: str = "mpe"
+    env_family: str = "sisl"
     """ Env family when using pz"""
     agent_ids: bool = True
     """ Include id (one-hot vector) at the agent of the observations"""
-    batch_size: int = 3
+    batch_size: int = 10
     """ Number of episodes to collect in each rollout"""
-    actor_hidden_dim: int = 32
+    actor_hidden_dim: int = 64
     """ Hidden dimension of actor network"""
     actor_num_layers: int = 1
     """ Number of hidden layers of actor network"""
-    critic_hidden_dim: int = 32
+    critic_hidden_dim: int = 64
     """ Hidden dimension of critic network"""
     critic_num_layers: int = 1
     """ Number of hidden layers of critic network"""
@@ -41,25 +39,25 @@ class Args:
     """ Learning rate for the actor"""
     learning_rate_critic: float = 0.0008
     """ Learning rate for the critic"""
-    total_timesteps: int = 1000000
+    total_timesteps: int = 25000000
     """ Total steps in the environment during training"""
     gamma: float = 0.99
     """ Discount factor"""
     td_lambda: float = 0.95
     """ TD(λ) discount factor"""
-    normalize_reward: bool = False
+    normalize_reward: bool = True
     """ Normalize the rewards if True"""
-    normalize_advantage: bool = False
+    normalize_advantage: bool = True
     """ Normalize the advantage if True"""
-    normalize_return: bool = False
+    normalize_return: bool = True
     """ Normalize the returns if True"""
     ppo_clip: float = 0.2
     """ PPO clipping factor """
     entropy_coef: float = 0.001
     """ Entropy coefficient """
-    epochs: int = 3
+    epochs: int = 10
     """ Number of training epochs"""
-    clip_gradients: float = -1
+    clip_gradients: float = 1
     """ 0< for no clipping and 0> if clipping at clip_gradients"""
     log_every: int = 10
     """ Logging steps """
@@ -113,12 +111,9 @@ class RolloutBuffer:
         obs = torch.zeros(
             (self.buffer_size, max_length, self.num_agents, self.obs_space)
         ).to(self.device)
-        avail_actions = torch.zeros(
+        actions = torch.zeros(
             (self.buffer_size, max_length, self.num_agents, self.action_space)
         ).to(self.device)
-        actions = torch.zeros((self.buffer_size, max_length, self.num_agents)).to(
-            self.device
-        )
         log_probs = torch.zeros((self.buffer_size, max_length, self.num_agents)).to(
             self.device
         )
@@ -133,7 +128,6 @@ class RolloutBuffer:
         for i in range(self.buffer_size):
             length = lengths[i]
             obs[i, :length] = self.episodes[i]["obs"]
-            avail_actions[i, :length] = self.episodes[i]["avail_actions"]
             actions[i, :length] = self.episodes[i]["actions"]
             log_probs[i, :length] = self.episodes[i]["log_prob"]
             reward[i, :length] = self.episodes[i]["reward"]
@@ -144,6 +138,7 @@ class RolloutBuffer:
             mu = torch.mean(reward[mask])
             std = torch.std(reward[mask])
             reward[mask.bool()] = (reward[mask] - mu) / (std + 1e-6)
+
         self.episodes = [None] * self.buffer_size
         return (
             obs.float(),
@@ -151,7 +146,6 @@ class RolloutBuffer:
             log_probs.float(),
             reward.float(),
             states.float(),
-            avail_actions.bool(),
             done.float(),
             mask,
         )
@@ -160,27 +154,48 @@ class RolloutBuffer:
 class Actor(nn.Module):
     def __init__(self, input_dim, hidden_dim, num_layer, output_dim) -> None:
         super().__init__()
-        self.output_dim = output_dim
-        self.layers = nn.ModuleList()
-        self.layers.append(nn.Sequential(nn.Linear(input_dim, hidden_dim), nn.ReLU()))
-        for i in range(num_layer):
-            self.layers.append(
+        mean_layers = [nn.Sequential(nn.Linear(input_dim, hidden_dim), nn.ReLU())]
+        logstd_layers = [nn.Sequential(nn.Linear(input_dim, hidden_dim), nn.ReLU())]
+        for _ in range(num_layer):
+            mean_layers.append(
                 nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.ReLU())
             )
-        self.layers.append(nn.Sequential(nn.Linear(hidden_dim, output_dim)))
+            logstd_layers.append(
+                nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.ReLU())
+            )
+        mean_layers.append(nn.Sequential(nn.Linear(hidden_dim, output_dim)))
+        logstd_layers.append(nn.Sequential(nn.Linear(hidden_dim, output_dim)))
+        self.mean_layers = nn.ModuleList(mean_layers)
+        # self.logstd_layers = nn.ModuleList(logstd_layers)
+        self.logstd_layer = nn.Parameter(
+            torch.zeros(output_dim) - 2, requires_grad=True
+        )
 
-    def act(self, x, avail_action=None):
-        logits = self.logits(x, avail_action)
-        distribution = Categorical(logits=logits)
-        action = distribution.sample()
-        return action, distribution.log_prob(action)
-
-    def logits(self, x, avail_action=None):
-        for layer in self.layers:
+    def mean(self, x):
+        for layer in self.mean_layers:
             x = layer(x)
-        if avail_action is not None:
-            x = x.masked_fill(~avail_action, -1e9)
         return x
+
+    # def logstd(self, x):
+    #     for layer in self.logstd_layers:
+    #         x = layer(x)
+    #     return x
+
+    def act(self, x, actions=None):
+        mean = self.mean(x)
+        std = self.logstd_layer.exp()
+        distribution = Normal(mean, std)
+        ## See Soft Actor-Critic paper, page 12 (https://arxiv.org/pdf/1801.01290)
+        if actions is None:
+            u = distribution.sample()
+            actions = torch.tanh(u)
+        else:
+            u = torch.atanh(torch.clamp(actions, -0.999999, 0.999999))
+        log_prob_u = distribution.log_prob(u).sum(dim=-1)
+        log_prob_tanh = torch.sum(torch.log(1.0 - actions.pow(2) + 1e-6), dim=-1)
+        log_probs = log_prob_u - log_prob_tanh
+        entropy = distribution.entropy().sum(dim=-1)
+        return actions, log_probs, entropy
 
 
 class Critic(nn.Module):
@@ -197,12 +212,7 @@ class Critic(nn.Module):
     def forward(self, x):
         for layer in self.layers:
             x = layer(x)
-        return x.squeeze()
-
-
-def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
-    slope = (end_e - start_e) / duration
-    return max(slope * t + start_e, end_e)
+        return x
 
 
 def environment(env_type, env_name, env_family, agent_ids, kwargs):
@@ -210,16 +220,11 @@ def environment(env_type, env_name, env_family, agent_ids, kwargs):
         env = PettingZooWrapper(
             family=env_family, env_name=env_name, agent_ids=agent_ids, **kwargs
         )
-    elif env_type == "smaclite":
-        env = SMACliteWrapper(map_name=env_name, agent_ids=agent_ids, **kwargs)
-    elif env_type == "lbf":
-        env = LBFWrapper(map_name=env_name, agent_ids=agent_ids, **kwargs)
-
     return env
 
 
 def norm_d(grads, d):
-    norms = [torch.linalg.vector_norm(g.detach(), d) for g in grads]
+    norms = [torch.linalg.vector_norm(g.detach(), d) for g in grads if g is not None]
     total_norm_d = torch.linalg.vector_norm(torch.tensor(norms), d)
     return total_norm_d
 
@@ -249,9 +254,8 @@ def env_worker(conn, env_serialized):
         task, content = conn.recv()
         if task == "reset":
             obs, _ = env.reset(seed=random.randint(0, 100000))
-            avail_actions = env.get_avail_actions()
             state = env.get_state()
-            content = {"obs": obs, "avail_actions": avail_actions, "state": state}
+            content = {"obs": obs, "state": state}
             conn.send(content)
         elif task == "get_env_info":
             content = {
@@ -267,7 +271,6 @@ def env_worker(conn, env_serialized):
             conn.send(content)
         elif task == "step":
             next_obs, reward, done, truncated, infos = env.step(content)
-            avail_actions = env.get_avail_actions()
             state = env.get_state()
             content = {
                 "next_obs": next_obs,
@@ -275,7 +278,6 @@ def env_worker(conn, env_serialized):
                 "done": done,
                 "truncated": truncated,
                 "infos": infos,
-                "avail_actions": avail_actions,
                 "next_state": state,
             }
             conn.send(content)
@@ -287,7 +289,7 @@ def env_worker(conn, env_serialized):
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
-    # Set the random seeds
+    # Set the random seed
     seed = args.seed
     random.seed(seed)
     np.random.seed(seed)
@@ -295,9 +297,9 @@ if __name__ == "__main__":
     device = torch.device(args.device)
     ## import the environment
     kwargs = {}  # {"render_mode":'human',"shared_reward":False}
-    ## Create the pipes to communicate between the main process (IPPO algorithm) and child processes (envs)
+    ## Create the pipes to communicate between the main process (MAPPO algorithm) and child processes (envs)
     conns = [Pipe() for _ in range(args.batch_size)]
-    ippo_conns, env_conns = zip(*conns)
+    mappo_conns, env_conns = zip(*conns)
     envs = [
         CloudpickleWrapper(
             environment(
@@ -333,13 +335,18 @@ if __name__ == "__main__":
         output_dim=eval_env.get_action_size(),
     ).to(device)
     critic = Critic(
-        input_dim=eval_env.get_obs_size(),
+        input_dim=eval_env.get_state_size(),
         hidden_dim=args.critic_hidden_dim,
         num_layer=args.critic_num_layers,
     ).to(device)
+
     Optimizer = getattr(optim, args.optimizer)
-    actor_optimizer = Optimizer(actor.parameters(), lr=args.learning_rate_actor)
-    critic_optimizer = Optimizer(critic.parameters(), lr=args.learning_rate_critic)
+    actor_optimizer = Optimizer(
+        actor.parameters(), lr=args.learning_rate_actor, eps=1e-5
+    )
+    critic_optimizer = Optimizer(
+        critic.parameters(), lr=args.learning_rate_critic, eps=1e-5
+    )
 
     time_token = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     run_name = f"{args.env_type}__{args.env_name}__{time_token}"
@@ -351,9 +358,9 @@ if __name__ == "__main__":
             entity=args.wnb_entity,
             sync_tensorboard=True,
             config=vars(args),
-            name=f"IPPO-multienvs-{run_name}",
+            name=f"MAPPO-Continuous-multienvs-{run_name}",
         )
-    writer = SummaryWriter(f"runs/IPPO-multienvs-{run_name}")
+    writer = SummaryWriter(f"runs/MAPPO-Continuous-multienvs-{run_name}")
     writer.add_text(
         "hyperparameters",
         "|param|value|\n|-|-|\n%s"
@@ -384,19 +391,14 @@ if __name__ == "__main__":
                 "reward": [],
                 "states": [],
                 "done": [],
-                "avail_actions": [],
             }
             for _ in range(args.batch_size)
         ]
 
-        for ippo_conn in ippo_conns:
-            ippo_conn.send(("reset", None))
-
-        contents = [ippo_conn.recv() for ippo_conn in ippo_conns]
+        for mappo_conn in mappo_conns:
+            mappo_conn.send(("reset", None))
+        contents = [mappo_conn.recv() for mappo_conn in mappo_conns]
         obs = np.stack([content["obs"] for content in contents], axis=0)
-        avail_action = np.stack(
-            [content["avail_actions"] for content in contents], axis=0
-        )
         state = np.stack([content["state"] for content in contents])
         alive_envs = list(range(args.batch_size))
         ep_reward, ep_length, ep_stat = (
@@ -406,20 +408,18 @@ if __name__ == "__main__":
         )
         while len(alive_envs) > 0:
             with torch.no_grad():
-                actions, log_probs = actor.act(
-                    torch.from_numpy(obs).float().to(device),
-                    avail_action=torch.tensor(avail_action).bool().to(device),
+                actions, log_probs, _ = actor.act(
+                    torch.from_numpy(obs).float().to(device)
                 )
                 actions, log_probs = actions.cpu().numpy(), log_probs.cpu()
             for i, j in enumerate(alive_envs):
-                ippo_conns[j].send(("step", actions[i]))
-            contents = [ippo_conns[i].recv() for i in alive_envs]
+                mappo_conns[j].send(("step", actions[i]))
+            contents = [mappo_conns[i].recv() for i in alive_envs]
             next_obs = [content["next_obs"] for content in contents]
             reward = [content["reward"] for content in contents]
             done = [content["done"] for content in contents]
             truncated = [content["truncated"] for content in contents]
             infos = [content.get("infos") for content in contents]
-            next_avail_action = [content["avail_actions"] for content in contents]
             next_state = [content["next_state"] for content in contents]
             for i, j in enumerate(alive_envs):
                 episodes[j]["obs"].append(obs[i])
@@ -428,15 +428,11 @@ if __name__ == "__main__":
                 episodes[j]["reward"].append(reward[i])
                 episodes[j]["states"].append(state[i])
                 episodes[j]["done"].append(done[i])
-                episodes[j]["avail_actions"].append(avail_action[i])
                 ep_reward[j] += reward[i]
                 ep_length[j] += 1
-
             step += len(alive_envs)
-
             obs = []
             state = []
-            avail_action = []
             for i, j in enumerate(alive_envs[:]):
                 if done[i] or truncated[i]:
                     alive_envs.remove(j)
@@ -446,18 +442,15 @@ if __name__ == "__main__":
                         ep_stat[j] = infos[i]
                 else:
                     obs.append(next_obs[i])
-                    avail_action.append(next_avail_action[i])
                     state.append(next_state[i])
             if obs:
                 obs = np.stack(obs, axis=0)
-                avail_action = np.stack(avail_action, axis=0)
                 state = np.stack(state, axis=0)
-
-        num_episodes += args.batch_size
         ep_rewards.extend(ep_reward)
         ep_lengths.extend(ep_length)
         if args.env_type == "smaclite":
             ep_stats.extend([info["battle_won"] for info in ep_stat])
+        num_episodes += args.batch_size
         ## logging
         if len(ep_rewards) > args.log_every:
             writer.add_scalar("rollout/ep_reward", np.mean(ep_rewards), step)
@@ -475,24 +468,24 @@ if __name__ == "__main__":
             b_log_probs,
             b_reward,
             b_states,
-            b_avail_actions,
             b_done,
             b_mask,
         ) = rb.get_batch()
         # Compute the advantage
         #####  Compute TD(λ) using "Reconciling λ-Returns with Experience Replay"(https://arxiv.org/pdf/1810.09967 Equation 3)
         #####  Compute the advantage using A(s,a) = λ-Returns -V(s), see page 47 in David Silver's lecture n 4 (https://davidstarsilver.wordpress.com/wp-content/uploads/2025/04/lecture-4-model-free-prediction-.pdf)
-        return_lambda = torch.zeros_like(b_actions).float().to(device)
-        advantages = torch.zeros_like(b_actions).float().to(device)
+        return_lambda = torch.zeros_like(b_log_probs).float().to(device)
+        advantages = torch.zeros_like(b_log_probs).float().to(device)
         with torch.no_grad():
             for ep_idx in range(return_lambda.size(0)):
                 ep_len = b_mask[ep_idx].sum()
                 last_return_lambda = 0
+                last_advantage = 0
                 for t in reversed(range(ep_len)):
                     if t == (ep_len - 1):
                         next_value = 0
                     else:
-                        next_value = critic(x=b_obs[ep_idx, t + 1])
+                        next_value = critic(x=b_states[ep_idx, t + 1])
                     return_lambda[ep_idx, t] = last_return_lambda = b_reward[
                         ep_idx, t
                     ] + args.gamma * (
@@ -500,9 +493,8 @@ if __name__ == "__main__":
                         + (1 - args.td_lambda) * next_value
                     )
                     advantages[ep_idx, t] = return_lambda[ep_idx, t] - critic(
-                        x=b_obs[ep_idx, t]
+                        x=b_states[ep_idx, t]
                     )
-        # training loop
         if args.normalize_advantage:
             adv_mu = advantages.mean(dim=-1)[b_mask].mean()
             adv_std = advantages.mean(dim=-1)[b_mask].std()
@@ -511,6 +503,7 @@ if __name__ == "__main__":
             ret_mu = return_lambda.mean(dim=-1)[b_mask].mean()
             ret_std = return_lambda.mean(dim=-1)[b_mask].std()
             return_lambda = (return_lambda - ret_mu) / ret_std
+        # training loop
         actor_losses = []
         critic_losses = []
         entropies_bonuses = []
@@ -527,11 +520,10 @@ if __name__ == "__main__":
             for t in range(b_obs.size(1)):
                 # policy gradient (PG) loss
                 ## PG: compute the ratio:
-                current_logits = actor.logits(
-                    x=b_obs[:, t], avail_action=b_avail_actions[:, t]
+                _, current_logprob, current_entropy = actor.act(
+                    x=b_obs[:, t],
+                    actions=b_actions[:, t],
                 )
-                current_dist = Categorical(logits=current_logits)
-                current_logprob = current_dist.log_prob(b_actions[:, t])
                 log_ratio = current_logprob - b_log_probs[:, t]
                 ratio = torch.exp(log_ratio)
                 ## Compute PG the loss
@@ -544,19 +536,16 @@ if __name__ == "__main__":
                     .mean(dim=-1)
                     .sum()
                 )
-
                 # Compute entropy bonus
-                entropy_loss = current_dist.entropy()[b_mask[:, t]].mean(dim=-1).sum()
+                entropy_loss = current_entropy[b_mask[:, t]].mean(dim=-1).sum()
                 entropies += entropy_loss
                 actor_loss += -pg_loss - args.entropy_coef * entropy_loss
-
                 # Compute the value loss
-                current_values = critic(x=b_obs[:, t])
+                current_values = critic(x=b_states[:, t]).expand(-1, eval_env.n_agents)
                 value_loss = F.mse_loss(
                     current_values[b_mask[:, t]], return_lambda[:, t][b_mask[:, t]]
                 ) * (b_mask[:, t].sum())
                 critic_loss += value_loss
-
                 # track kl distance
                 b_kl_divergence = (
                     ((ratio - 1) - log_ratio)[b_mask[:, t]].mean(dim=-1).sum()
@@ -568,6 +557,7 @@ if __name__ == "__main__":
                     .mean(dim=-1)
                     .sum()
                 )
+
             actor_loss /= b_mask.sum()
             critic_loss /= b_mask.sum()
             entropies /= b_mask.sum()
@@ -582,7 +572,6 @@ if __name__ == "__main__":
 
             actor_gradient = norm_d([p.grad for p in actor.parameters()], 2)
             critic_gradient = norm_d([p.grad for p in critic.parameters()], 2)
-
             if args.clip_gradients > 0:
                 torch.nn.utils.clip_grad_norm_(
                     actor.parameters(), max_norm=args.clip_gradients
@@ -593,6 +582,7 @@ if __name__ == "__main__":
             actor_optimizer.step()
             critic_optimizer.step()
             training_step += 1
+
             actor_losses.append(actor_loss.item())
             critic_losses.append(critic_loss.item())
             entropies_bonuses.append(entropies.item())
@@ -620,11 +610,8 @@ if __name__ == "__main__":
             current_ep_length = 0
             while eval_ep < args.num_eval_ep:
                 with torch.no_grad():
-                    actions, _ = actor.act(
+                    actions, _, _ = actor.act(
                         torch.from_numpy(eval_obs).float().to(device),
-                        avail_action=torch.tensor(eval_env.get_avail_actions())
-                        .bool()
-                        .to(device),
                     )
                 next_obs_, reward, done, truncated, infos = eval_env.step(
                     actions.cpu().numpy()
@@ -654,7 +641,7 @@ if __name__ == "__main__":
     if args.use_wnb:
         wandb.finish()
     eval_env.close()
-    for conn in ippo_conns:
+    for conn in mappo_conns:
         conn.send(("close", None))
     for process in processes:
         process.join()

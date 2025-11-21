@@ -484,6 +484,7 @@ if __name__ == "__main__":
                     )
                 else:
                     actions_to_take = torch.argmax(actions, dim=-1)
+                actions_to_take = actions_to_take.cpu().numpy()
             for i, j in enumerate(alive_envs):
                 facmac_conns[j].send(("step", actions_to_take[i]))
             contents = [facmac_conns[i].recv() for i in alive_envs]
@@ -671,7 +672,7 @@ if __name__ == "__main__":
                         )
                         eval_actions = torch.argmax(logits, dim=-1)
                     next_obs_, reward, done, truncated, infos = eval_env.step(
-                        eval_actions
+                        eval_actions.cpu().numpy()
                     )
                     current_reward += reward
                     current_ep_length += 1

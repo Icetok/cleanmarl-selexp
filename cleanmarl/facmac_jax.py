@@ -629,7 +629,9 @@ if __name__ == "__main__":
                 avail_action=jnp.asarray(avail_action).astype(jnp.bool_),
                 eps=epsilon,
             )
-            next_obs, reward, done, truncated, infos = env.step(actions_to_take)
+            next_obs, reward, done, truncated, infos = env.step(
+                np.array(actions_to_take)
+            )
             ep_reward += reward
             ep_length += 1
             step += 1
@@ -736,7 +738,7 @@ if __name__ == "__main__":
                         ),
                     )
                     next_obs_, reward, done, truncated, infos = eval_env.step(
-                        eval_actions
+                        np.array(eval_actions)
                     )
                     current_reward += reward
                     current_ep_length += 1

@@ -346,7 +346,7 @@ if __name__ == "__main__":
                     avail_action=torch.from_numpy(avail_action).bool().to(device),
                     hard=True,
                 )  ## These are one hot-vectors
-                actions = actions.cpu()
+                actions = actions.cpu().numpy()
                 actions_to_take = torch.argmax(actions, dim=-1)
 
             next_obs, reward, done, truncated, infos = env.step(actions_to_take)
@@ -546,7 +546,9 @@ if __name__ == "__main__":
                         .to(device),
                     )
                     eval_actions = torch.argmax(logits, dim=-1)
-                next_obs_, reward, done, truncated, infos = eval_env.step(eval_actions)
+                next_obs_, reward, done, truncated, infos = eval_env.step(
+                    eval_actions.cpu().numpy()
+                )
                 current_reward += reward
                 current_ep_length += 1
                 eval_obs = next_obs_

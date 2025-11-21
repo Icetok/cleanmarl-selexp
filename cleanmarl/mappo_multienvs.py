@@ -295,7 +295,7 @@ if __name__ == "__main__":
     device = torch.device(args.device)
     ## import the environment
     kwargs = {}  # {"render_mode":'human',"shared_reward":False}
-    ## Create the pipes to communicate between the main process (COMA algorithm) and child processes (envs)
+    ## Create the pipes to communicate between the main process (MAPPO algorithm) and child processes (envs)
     conns = [Pipe() for _ in range(args.batch_size)]
     mappo_conns, env_conns = zip(*conns)
     envs = [
@@ -411,7 +411,7 @@ if __name__ == "__main__":
                     torch.from_numpy(obs).float().to(device),
                     avail_action=torch.from_numpy(avail_action).bool().to(device),
                 )
-                actions, log_probs = actions.cpu(), log_probs.cpu()
+                actions, log_probs = actions.cpu().numpy(), log_probs.cpu()
             for i, j in enumerate(alive_envs):
                 mappo_conns[j].send(("step", actions[i]))
             contents = [mappo_conns[i].recv() for i in alive_envs]
@@ -627,7 +627,9 @@ if __name__ == "__main__":
                         .bool()
                         .to(device),
                     )
-                next_obs_, reward, done, truncated, infos = eval_env.step(actions)
+                next_obs_, reward, done, truncated, infos = eval_env.step(
+                    actions.cpu().numpy()
+                )
                 current_reward += reward
                 current_ep_length += 1
                 eval_obs = next_obs_

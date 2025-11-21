@@ -490,7 +490,7 @@ if __name__ == "__main__":
             if random.random() < epsilon:
                 actions = env.sample()
 
-            next_obs, reward, done, truncated, infos = env.step(actions)
+            next_obs, reward, done, truncated, infos = env.step(np.array(actions))
             avail_action = env.get_avail_actions()  # Get the mask of 'next_obs' and store it in the replay, we need it for the bellman loss
             next_state = env.get_state()
 
@@ -604,7 +604,9 @@ if __name__ == "__main__":
                     h_eval,
                     jnp.asarray(eval_env.get_avail_actions().astype(jnp.bool)),
                 )
-                next_obs_, reward, done, truncated, infos = eval_env.step(actions)
+                next_obs_, reward, done, truncated, infos = eval_env.step(
+                    np.array(actions)
+                )
                 current_reward += reward
                 current_ep_length += 1
                 eval_obs = next_obs_

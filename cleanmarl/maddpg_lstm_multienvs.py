@@ -460,7 +460,7 @@ if __name__ == "__main__":
                     actions = actions.reshape(
                         len(alive_envs), eval_env.n_agents, -1
                     ).cpu()
-                    actions_to_take = torch.argmax(actions, dim=-1)
+                    actions_to_take = torch.argmax(actions, dim=-1).numpy()
                 if h is None:
                     h = alive_h
                 else:
@@ -701,7 +701,9 @@ if __name__ == "__main__":
                         .to(device),
                     )
                     eval_actions = torch.argmax(logits, dim=-1)
-                next_obs_, reward, done, truncated, infos = eval_env.step(eval_actions)
+                next_obs_, reward, done, truncated, infos = eval_env.step(
+                    eval_actions.cpu().numpy()
+                )
                 current_reward += reward
                 current_ep_length += 1
                 eval_obs = next_obs_

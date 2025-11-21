@@ -321,7 +321,9 @@ if __name__ == "__main__":
                         torch.from_numpy(obs).float().to(device),
                         avail_action=torch.from_numpy(avail_action).bool().to(device),
                     )
-                next_obs, reward, done, truncated, infos = env.step(actions)
+                next_obs, reward, done, truncated, infos = env.step(
+                    actions.cpu().numpy()
+                )
                 ep_reward += reward
                 ep_length += 1
                 step += 1
@@ -535,7 +537,9 @@ if __name__ == "__main__":
                         .bool()
                         .to(device),
                     )
-                next_obs_, reward, done, truncated, infos = eval_env.step(actions)
+                next_obs_, reward, done, truncated, infos = eval_env.step(
+                    actions.cpu().numpy()
+                )
                 current_reward += reward
                 current_ep_length += 1
                 eval_obs = next_obs_

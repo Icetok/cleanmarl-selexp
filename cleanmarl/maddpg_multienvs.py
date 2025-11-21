@@ -438,8 +438,8 @@ if __name__ == "__main__":
                     torch.from_numpy(obs).float().to(device),
                     avail_action=torch.from_numpy(avail_action).bool().to(device),
                     hard=True,
-                ).cpu()  ## These are one hot-vectors
-                actions_to_take = torch.argmax(actions, dim=-1)
+                )  ## These are one hot-vectors
+                actions_to_take = torch.argmax(actions, dim=-1).cpu().numpy()
             for i, j in enumerate(alive_envs):
                 maddpg_conns[j].send(("step", actions_to_take[i]))
             contents = [maddpg_conns[i].recv() for i in alive_envs]
@@ -624,7 +624,9 @@ if __name__ == "__main__":
                     .to(device),
                 )
                 eval_actions = torch.argmax(logits, dim=-1)
-                next_obs_, reward, done, truncated, infos = eval_env.step(eval_actions)
+                next_obs_, reward, done, truncated, infos = eval_env.step(
+                    eval_actions.cpu().numpy()
+                )
                 current_reward += reward
                 current_ep_length += 1
                 eval_obs = next_obs_

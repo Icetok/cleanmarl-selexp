@@ -512,7 +512,9 @@ if __name__ == "__main__":
                 avail_action = avail_action.reshape(
                     len(alive_envs), eval_env.n_agents, -1
                 )
-                actions = actions.reshape(len(alive_envs), eval_env.n_agents).cpu()
+                actions = (
+                    actions.reshape(len(alive_envs), eval_env.n_agents).cpu().numpy()
+                )
             for i, j in enumerate(alive_envs):
                 coma_conns[j].send(("step", actions[i]))
 
@@ -765,7 +767,9 @@ if __name__ == "__main__":
                         .bool()
                         .to(device),
                     )
-                next_obs_, reward, done, truncated, infos = eval_env.step(actions.cpu())
+                next_obs_, reward, done, truncated, infos = eval_env.step(
+                    actions.cpu().numpy()
+                )
                 current_reward += reward
                 current_ep_length += 1
                 eval_obs = next_obs_

@@ -448,7 +448,7 @@ if __name__ == "__main__":
                             device
                         ),
                     )
-                actions = torch.argmax(q_values, dim=-1).cpu()
+                actions = torch.argmax(q_values, dim=-1).cpu().numpy()
             # Send actions
             for i, j in enumerate(alive_envs):
                 qmix_conns[j].send(("step", actions[i]))
@@ -608,7 +608,7 @@ if __name__ == "__main__":
                         eval_env.get_avail_actions(), dtype=torch.bool
                     ).to(device),
                 )
-                actions = torch.argmax(q_values, dim=-1)
+                actions = torch.argmax(q_values, dim=-1).cpu().numpy()
                 next_obs_, reward, done, truncated, infos = eval_env.step(actions)
                 current_reward += reward
                 current_ep_length += 1

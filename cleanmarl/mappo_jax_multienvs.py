@@ -699,6 +699,7 @@ if __name__ == "__main__":
                 act_key,
                 avail_action=jnp.asarray(avail_action).astype(jnp.bool_),
             )
+            actions = np.array(actions)
             if log_probs.ndim >= 2:
                 log_probs = log_probs.squeeze()
             else:
@@ -849,7 +850,9 @@ if __name__ == "__main__":
                         jnp.bool_
                     ),
                 )
-                next_obs_, reward, done, truncated, infos = eval_env.step(actions)
+                next_obs_, reward, done, truncated, infos = eval_env.step(
+                    np.array(actions)
+                )
                 current_reward += reward
                 current_ep_length += 1
                 eval_obs = next_obs_

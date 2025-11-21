@@ -384,7 +384,7 @@ if __name__ == "__main__":
                         device
                     ),
                 )
-            actions = torch.argmax(q_values, dim=-1).cpu()
+            actions = torch.argmax(q_values, dim=-1).cpu().numpy()
         # Execute the action
         for i, vdn_conn in enumerate(vdn_conns):
             vdn_conn.send(("step", actions[i]))
@@ -494,7 +494,9 @@ if __name__ == "__main__":
                     ).to(device),
                 )
                 actions = torch.argmax(q_values, dim=-1)
-                next_obs_, reward, done, truncated, infos = eval_env.step(actions.cpu())
+                next_obs_, reward, done, truncated, infos = eval_env.step(
+                    actions.cpu().numpy()
+                )
                 current_reward += reward
                 current_ep_length += 1
                 eval_obs = next_obs_

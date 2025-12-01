@@ -18,7 +18,7 @@ from torch.utils.tensorboard import SummaryWriter
 @dataclass
 class Args:
     env_type: str = "smaclite"  # "pz"
-    """ Pettingzoo, SMAClite ... """
+    """ pz(for Pettingzoo), smaclite (for SMAClite), lbf (for LBF) ... """
     env_name: str = "3m"  # "simple_spread_v3" #"pursuit_v4"
     """ Name of the environment """
     env_family: str = "mpe"  # "sisl"
@@ -59,10 +59,10 @@ class Args:
     """ Frequency of updating target network. The used value is target_network_update_freq*num_envs"""
     polyak: float = 0.005
     """ Update the target network each target_network_update_freq» step in the environment"""
-    log_every: int = 10
-    """ Logging steps"""
     normalize_reward: bool = False
     """ Normalize the rewards"""
+    log_every: int = 10
+    """ Logging steps"""
     eval_steps: int = 5000
     """ Evaluate the policy each eval_steps steps. The used value is eval_steps*num_envs"""
     num_eval_ep: int = 5
@@ -73,6 +73,8 @@ class Args:
     """ Weights & Biases project name"""
     wnb_entity: str = ""
     """ Weights & Biases entity name"""
+    save_model: bool = False
+    """ If True, save the weights of the agents and hyperparameters"""
     device: str = "cpu"
     """ Device (cpu, cuda, mps)"""
     seed: int = 1
@@ -349,7 +351,7 @@ if __name__ == "__main__":
 
     # Reset the environments
     for vdn_conn in vdn_conns:
-        vdn_conn.send(("reset", None))
+        vdn_conn.send(("reset", seed))
     contents = [vdn_conn.recv() for vdn_conn in vdn_conns]
     obs = np.stack([content["obs"] for content in contents], axis=0)
     avail_action = np.stack([content["avail_actions"] for content in contents], axis=0)
@@ -517,6 +519,18 @@ if __name__ == "__main__":
                     np.mean([info["battle_won"] for info in eval_ep_stats]),
                     step,
                 )
+
+    if args.save_model:
+        # Save the weights
+        vdn_model_path = f"runs/VDN-multienvs-{run_name}/agent.pt"
+        torch.save(utility_network.state_dict(), vdn_model_path)
+        # Save the args
+        import json
+        from dataclasses import asdict
+
+        vdn_args_path = f"runs/VDN-multienvs-{run_name}/args.json"
+        with open(vdn_args_path, "w") as f:
+            json.dump(asdict(args), f, indent=2)
 
     writer.close()
     if args.use_wnb:

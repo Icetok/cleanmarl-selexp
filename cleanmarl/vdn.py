@@ -16,9 +16,9 @@ from torch.utils.tensorboard import SummaryWriter
 
 @dataclass
 class Args:
-    env_type: str = "pz"  # "pz"
-    """ Pettingzoo, SMAClite ... """
-    env_name: str = "simple_spread_v3"  # "simple_spread_v3" #"pursuit_v4"
+    env_type: str = "smaclite"  # "pz"
+    """ pz(for Pettingzoo), smaclite (for SMAClite), lbf (for LBF) ... """
+    env_name: str = "3m"  # "simple_spread_v3" #"pursuit_v4"
     """ Name of the environment """
     env_family: str = "mpe"
     """ Env family when using pz"""
@@ -70,6 +70,8 @@ class Args:
     """ Weights & Biases project name"""
     wnb_entity: str = ""
     """ Weights & Biases entity name"""
+    save_model: bool = False
+    """ If True, save the weights of the agents and hyperparameters"""
     device: str = "cpu"
     """ Device (cpu, cuda, mps)"""
     seed: int = 1
@@ -165,7 +167,6 @@ def environment(env_type, env_name, env_family, agent_ids, kwargs):
         env = SMACliteWrapper(map_name=env_name, agent_ids=agent_ids, **kwargs)
     elif env_type == "lbf":
         env = LBFWrapper(map_name=env_name, agent_ids=agent_ids, **kwargs)
-
     return env
 
 
@@ -189,7 +190,7 @@ if __name__ == "__main__":
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-
+    # Set device
     device = torch.device(args.device)
     # Import the environment
     kwargs = {}  # {"render_mode":'human',"shared_reward":False}
@@ -207,7 +208,6 @@ if __name__ == "__main__":
         agent_ids=args.agent_ids,
         kwargs=kwargs,
     )
-
     # Initialize the utility and target networks
     utility_network = Qnetwrok(
         input_dim=env.get_obs_size(),
@@ -249,7 +249,7 @@ if __name__ == "__main__":
         % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
 
-    obs, _ = env.reset()
+    obs, _ = env.reset(seed=seed)
     avail_action = env.get_avail_actions()
     ep_rewards = []
     ep_lengths = []
@@ -392,6 +392,18 @@ if __name__ == "__main__":
                     np.mean([info["battle_won"] for info in eval_ep_stats]),
                     step,
                 )
+
+    if args.save_model:
+        # Save the weights
+        vdn_model_path = f"runs/VDN-{run_name}/agent.pt"
+        torch.save(utility_network.state_dict(), vdn_model_path)
+        # Save the args
+        import json
+        from dataclasses import asdict
+
+        vdn_args_path = f"runs/VDN-{run_name}/args.json"
+        with open(vdn_args_path, "w") as f:
+            json.dump(asdict(args), f, indent=2)
 
     writer.close()
     if args.use_wnb:

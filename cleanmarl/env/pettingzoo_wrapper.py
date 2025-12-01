@@ -117,11 +117,9 @@ class PettingZooWrapper(CommonInterface):
         self.n_agents = self.env.num_agents
         self.agents = self.env.agents
         self.act_dim = flatdim(self.env.action_space(self.agents[0]))
-        # if isinstance(self.action_space ,gymnasium.spaces.Discrete):
-        #     self.act_dim = self.action_space.n
-        if isinstance(self.env.action_spaces[self.agents[0]], Box):
-            self.act_low = self.env.action_spaces[self.agents[0]].low
-            self.act_high = self.env.action_spaces[self.agents[0]].high
+        if isinstance(self.env.action_space(self.agents[0]), Box):
+            self.act_low = self.env.action_space(self.agents[0]).low
+            self.act_high = self.env.action_space(self.agents[0]).high
         self.obs_dim = flatdim(self.env.observation_space(self.agents[0]))
         self.agent_ids = agent_ids
 

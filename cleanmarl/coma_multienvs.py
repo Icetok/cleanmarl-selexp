@@ -1,4 +1,5 @@
 import tyro
+from typing import NamedTuple
 import datetime
 import random
 import copy
@@ -18,16 +19,18 @@ from torch.utils.tensorboard import SummaryWriter
 
 @dataclass
 class Args:
-    env_type: str = "smaclite"
-    """ Pettingzoo, SMAClite ... """
-    env_name: str = "3m"
-    """ Name of the environment"""
+    env_type: str = "smaclite"  # "pz"
+    """ pz(for Pettingzoo), smaclite (for SMAClite), lbf (for LBF) ... """
+    env_name: str = "3m"  # "simple_spread_v3" #"pursuit_v4"
+    """ Name of the environment """
     env_family: str = "mpe"
     """ Env family when using pz"""
     agent_ids: bool = True
     """ Include id (one-hot vector) at the agent of the observations"""
     batch_size: int = 3
     """ Number of episodes to collect in each rollout"""
+    minibatch_size: int = 6
+    """ Mini Batch size"""
     actor_hidden_dim: int = 32
     """ Hidden dimension of actor network"""
     actor_num_layers: int = 1
@@ -84,10 +87,22 @@ class Args:
     """ Weights & Biases project name"""
     wnb_entity: str = ""
     """ Weights & Biases entity name"""
+    save_model: bool = False
+    """ If True, save the weights of the agents and hyperparameters"""
     device: str = "cpu"
     """ Device (cpu, cuda, mps)"""
     seed: int = 1
     """ Random seed"""
+
+
+class Batch(NamedTuple):
+    batch_obs: torch.Tensor
+    batch_action: torch.Tensor
+    batch_reward: torch.Tensor
+    batch_states: torch.Tensor
+    batch_avail_action: torch.Tensor
+    batch_done: torch.Tensor
+    batch_mask: torch.Tensor
 
 
 class RolloutBuffer:
@@ -121,23 +136,17 @@ class RolloutBuffer:
         self.pos = 0
         lengths = [len(episode["obs"]) for episode in self.episodes]
         max_length = max(lengths)
-        obs = torch.zeros(
-            (self.buffer_size, max_length, self.num_agents, self.obs_space)
-        ).to(self.device)
+        obs = torch.zeros((self.buffer_size, max_length, self.num_agents, self.obs_space)).to(
+            self.device
+        )
         avail_actions = torch.zeros(
             (self.buffer_size, max_length, self.num_agents, self.action_space)
         ).to(self.device)
-        actions = torch.zeros((self.buffer_size, max_length, self.num_agents)).to(
-            self.device
-        )
+        actions = torch.zeros((self.buffer_size, max_length, self.num_agents)).to(self.device)
         reward = torch.zeros((self.buffer_size, max_length)).to(self.device)
-        states = torch.zeros((self.buffer_size, max_length, self.state_space)).to(
-            self.device
-        )
+        states = torch.zeros((self.buffer_size, max_length, self.state_space)).to(self.device)
         done = torch.zeros((self.buffer_size, max_length)).to(self.device)
-        mask = torch.zeros(self.buffer_size, max_length, dtype=torch.bool).to(
-            self.device
-        )
+        mask = torch.zeros(self.buffer_size, max_length, dtype=torch.bool).to(self.device)
         for i in range(self.buffer_size):
             length = lengths[i]
             obs[i, :length] = self.episodes[i]["obs"]
@@ -148,18 +157,16 @@ class RolloutBuffer:
             done[i, :length] = self.episodes[i]["done"]
             mask[i, :length] = 1
         if self.normalize_reward:
-            mu = torch.mean(reward[mask])
-            std = torch.std(reward[mask])
-            reward[mask.bool()] = (reward[mask] - mu) / (std + 1e-6)
+            reward = (reward - reward[mask].mean()) / (reward[mask].std() + 1e-6)
         self.episodes = [None] * self.buffer_size
-        return (
-            obs.float(),
-            actions.long(),
-            reward.float(),
-            states.float(),
-            avail_actions.bool(),
-            done.float(),
-            mask,
+        return Batch(
+            batch_obs=obs.float(),
+            batch_action=actions.long(),
+            batch_reward=reward.float(),
+            batch_states=states.float(),
+            batch_avail_action=avail_actions.bool(),
+            batch_done=done.float(),
+            batch_mask=mask,
         )
 
 
@@ -170,18 +177,11 @@ class Actor(nn.Module):
         self.layers = nn.ModuleList()
         self.layers.append(nn.Sequential(nn.Linear(input_dim, hidden_dim), nn.ReLU()))
         for i in range(num_layer):
-            self.layers.append(
-                nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.ReLU())
-            )
+            self.layers.append(nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.ReLU()))
         self.layers.append(nn.Sequential(nn.Linear(hidden_dim, output_dim)))
 
     def act(self, x, eps=0, avail_action=None):
-        for layer in self.layers:
-            x = layer(x)
-        if avail_action is not None:
-            x = x.masked_fill(~avail_action, -1e9)
-        masked_eps = (avail_action) * (eps / avail_action.sum(dim=-1, keepdim=True))
-        probs = (1 - eps) * F.softmax(x, dim=-1) + masked_eps
+        probs = self.logits(x=x, eps=eps, avail_action=avail_action)
         distribution = Categorical(probs)
         action = distribution.sample()
         return action
@@ -197,9 +197,7 @@ class Actor(nn.Module):
 
 
 class Critic(nn.Module):
-    def __init__(
-        self, input_dim, hidden_dim, num_layer, output_dim, num_agents
-    ) -> None:
+    def __init__(self, input_dim, hidden_dim, num_layer, output_dim, num_agents) -> None:
         super().__init__()
         self.num_agents = num_agents
         self.input_dim = input_dim
@@ -207,9 +205,7 @@ class Critic(nn.Module):
         self.layers = nn.ModuleList()
         self.layers.append(nn.Sequential(nn.Linear(input_dim, hidden_dim), nn.ReLU()))
         for i in range(num_layer):
-            self.layers.append(
-                nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.ReLU())
-            )
+            self.layers.append(nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.ReLU()))
         self.layers.append(nn.Sequential(nn.Linear(hidden_dim, output_dim)))
 
     def forward(self, state, observations, actions, avail_actions=None):
@@ -227,22 +223,16 @@ class Critic(nn.Module):
         return x.squeeze()
 
     def coma_inputs(self, state, observations, actions):
-        coma_inputs = torch.zeros((state.size(0), self.num_agents, self.input_dim)).to(
-            state.device
-        )
+        coma_inputs = torch.zeros((state.size(0), self.num_agents, self.input_dim)).to(state.device)
         coma_inputs[:, :, : state.size(-1)] = state.unsqueeze(1)
-        coma_inputs[:, :, state.size(-1) : state.size(-1) + observations.size(-1)] = (
-            observations
-        )
+        coma_inputs[:, :, state.size(-1) : state.size(-1) + observations.size(-1)] = observations
         one_hot = F.one_hot(actions.long(), num_classes=self.output_dim).float()
         mask = ~torch.eye(self.num_agents, dtype=torch.bool)
         oh = one_hot.unsqueeze(1).expand(
             state.size(0), self.num_agents, self.num_agents, self.output_dim
         )
         oh = oh[mask.unsqueeze(0).expand(state.size(0), -1, -1)]
-        oh = oh.view(
-            state.size(0), self.num_agents, (self.num_agents - 1) * self.output_dim
-        )
+        oh = oh.view(state.size(0), self.num_agents, (self.num_agents - 1) * self.output_dim)
         coma_inputs[:, :, state.size(-1) + observations.size(-1) :] = oh
         return coma_inputs
 
@@ -254,9 +244,7 @@ def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
 
 def environment(env_type, env_name, env_family, agent_ids, kwargs):
     if env_type == "pz":
-        env = PettingZooWrapper(
-            family=env_family, env_name=env_name, agent_ids=agent_ids, **kwargs
-        )
+        env = PettingZooWrapper(family=env_family, env_name=env_name, agent_ids=agent_ids, **kwargs)
     elif env_type == "smaclite":
         env = SMACliteWrapper(map_name=env_name, agent_ids=agent_ids, **kwargs)
     elif env_type == "lbf":
@@ -273,18 +261,26 @@ def norm_d(grads, d):
 
 def soft_update(target_net, critic_net, polyak):
     for target_param, param in zip(target_net.parameters(), critic_net.parameters()):
-        target_param.data.copy_(
-            polyak * param.data + (1.0 - polyak) * target_param.data
-        )
+        target_param.data.copy_(polyak * param.data + (1.0 - polyak) * target_param.data)
 
 
 def get_coma_critic_input_dim(env):
     critic_input_dim = (
-        env.get_obs_size()
-        + env.get_state_size()
-        + (env.n_agents - 1) * env.get_action_size()
+        env.get_obs_size() + env.get_state_size() + (env.n_agents - 1) * env.get_action_size()
     )
     return critic_input_dim
+
+
+def get_mini_batches(batch, t, minibatch_size):
+    return (
+        batch.batch_obs[:, t : t + minibatch_size].flatten(0, 1),
+        batch.batch_action[:, t : t + minibatch_size].flatten(0, 1),
+        batch.batch_reward[:, t : t + minibatch_size].flatten(0, 1),
+        batch.batch_states[:, t : t + minibatch_size].flatten(0, 1),
+        batch.batch_avail_action[:, t : t + minibatch_size].flatten(0, 1),
+        batch.batch_done[:, t : t + minibatch_size].flatten(0, 1),
+        batch.batch_mask[:, t : t + minibatch_size].flatten(0, 1),
+    )
 
 
 class CloudpickleWrapper:
@@ -311,7 +307,7 @@ def env_worker(conn, env_serialized):
     while True:
         task, content = conn.recv()
         if task == "reset":
-            obs, _ = env.reset(seed=random.randint(0, 100000))
+            obs, _ = env.reset(seed=content)
             avail_actions = env.get_avail_actions()
             state = env.get_state()
             content = {"obs": obs, "avail_actions": avail_actions, "state": state}
@@ -373,8 +369,7 @@ if __name__ == "__main__":
         for _ in range(args.batch_size)
     ]
     processes = [
-        Process(target=env_worker, args=(env_conns[i], envs[i]))
-        for i in range(args.batch_size)
+        Process(target=env_worker, args=(env_conns[i], envs[i])) for i in range(args.batch_size)
     ]
     for process in processes:
         process.daemon = True
@@ -458,14 +453,12 @@ if __name__ == "__main__":
             for _ in range(args.batch_size)
         ]
 
-        for coma_conn in coma_conns:
-            coma_conn.send(("reset", None))
+        for i, coma_conn in enumerate(coma_conns):
+            coma_conn.send(("reset", seed + i))
 
         contents = [coma_conn.recv() for coma_conn in coma_conns]
         obs = np.stack([content["obs"] for content in contents], axis=0)
-        avail_action = np.stack(
-            [content["avail_actions"] for content in contents], axis=0
-        )
+        avail_action = np.stack([content["avail_actions"] for content in contents], axis=0)
         state = np.stack([content["state"] for content in contents])
         alive_envs = list(range(args.batch_size))
         ep_reward, ep_length, ep_stat = (
@@ -535,9 +528,7 @@ if __name__ == "__main__":
             writer.add_scalar("rollout/ep_reward", np.mean(ep_rewards), step)
             writer.add_scalar("rollout/ep_length", np.mean(ep_lengths), step)
             writer.add_scalar("rollout/epsilon", epsilon, step)
-            writer.add_scalar(
-                "rollout/num_episodes", training_step * args.batch_size, step
-            )
+            writer.add_scalar("rollout/num_episodes", training_step * args.batch_size, step)
             if args.env_type == "smaclite":
                 writer.add_scalar(
                     "rollout/battle_won",
@@ -548,65 +539,57 @@ if __name__ == "__main__":
             ep_lengths = []
             ep_stats = []
         ## Collate episodes in buffer into single batch
-        b_obs, b_actions, b_reward, b_states, b_avail_actions, b_done, b_mask = (
-            rb.get_batch()
-        )
-
+        batch = rb.get_batch()
         ### 1. Compute TD(λ) using "Reconciling λ-Returns with Experience Replay"(https://arxiv.org/pdf/1810.09967 Equation 3)
-        with torch.no_grad():
-            return_lambda = torch.zeros_like(b_actions).float().to(device)
-            if args.use_tdlamda:
+        return_lambda = torch.zeros_like(batch.batch_action).float().to(device)
+        if args.use_tdlamda:
+            with torch.no_grad():
                 for ep_idx in range(return_lambda.size(0)):
-                    ep_len = b_mask[ep_idx].sum()
+                    ep_len = batch.batch_mask[ep_idx].sum()
                     last_return_lambda = 0
                     for t in reversed(range(ep_len)):
                         if t == (ep_len - 1):
                             next_action_value = 0
                         else:
                             next_action_value = target_critic(
-                                state=b_states[ep_idx, t + 1],
-                                observations=b_obs[ep_idx, t + 1],
-                                actions=b_actions[ep_idx, t + 1],
-                                avail_actions=b_avail_actions[ep_idx, t + 1],
+                                state=batch.batch_states[ep_idx, t + 1],
+                                observations=batch.batch_obs[ep_idx, t + 1],
+                                actions=batch.batch_action[ep_idx, t + 1],
+                                avail_actions=batch.batch_avail_action[ep_idx, t + 1],
                             )
-                            next_action_value = torch.gather(
-                                next_action_value,
-                                dim=-1,
-                                index=b_actions[ep_idx, t + 1].unsqueeze(-1),
-                            ).squeeze()
-                            # next_action_value, _ = next_action_value.max(dim=-1)
-                        return_lambda[ep_idx, t] = last_return_lambda = b_reward[
+
+                            next_action_value, _ = next_action_value.max(dim=-1)
+                        return_lambda[ep_idx, t] = last_return_lambda = batch.batch_reward[
                             ep_idx, t
                         ] + args.gamma * (
                             args.td_lambda * last_return_lambda
                             + (1 - args.td_lambda) * next_action_value
                         )
-            else:
+        else:
+            with torch.no_grad():
                 for ep_idx in range(return_lambda.size(0)):
-                    ep_len = b_mask[ep_idx].sum()
+                    ep_len = batch.batch_mask[ep_idx].sum()
                     for t in range(ep_len):
                         if t < (ep_len - args.nsteps):
-                            return_t_n = b_reward[ep_idx, t : t + args.nsteps]
+                            return_t_n = batch.batch_reward[ep_idx, t : t + args.nsteps]
                             discounts = torch.tensor(
                                 [args.gamma**i for i in range(return_t_n.size(-1))]
                             )
                             return_t_n = (return_t_n * discounts).sum(-1)
                             action_value_t_n = target_critic(
-                                state=b_states[ep_idx, t + args.nsteps],
-                                observations=b_obs[ep_idx, t + args.nsteps],
-                                actions=b_actions[ep_idx, t + args.nsteps],
-                                avail_actions=b_avail_actions[ep_idx, t + args.nsteps],
+                                state=batch.batch_states[ep_idx, t + args.nsteps],
+                                observations=batch.batch_obs[ep_idx, t + args.nsteps],
+                                actions=batch.batch_action[ep_idx, t + args.nsteps],
+                                avail_actions=batch.batch_avail_action[ep_idx, t + args.nsteps],
                             )
                             action_value_t_n = torch.gather(
                                 action_value_t_n,
                                 dim=-1,
-                                index=b_actions[ep_idx, t + args.nsteps].unsqueeze(-1),
+                                index=batch.batch_action[ep_idx, t + args.nsteps].unsqueeze(-1),
                             ).squeeze()
-                            return_t_n = (
-                                return_t_n + args.gamma**args.nsteps * action_value_t_n
-                            )
+                            return_t_n = return_t_n + args.gamma**args.nsteps * action_value_t_n
                         else:
-                            return_t_n = b_reward[ep_idx, t:]
+                            return_t_n = batch.batch_reward[ep_idx, t:]
                             discounts = torch.tensor(
                                 [args.gamma**i for i in range(return_t_n.size(-1))]
                             )
@@ -615,74 +598,81 @@ if __name__ == "__main__":
                         return_lambda[ep_idx, t] = return_t_n
 
         if args.normalize_return:
-            ret_mu = return_lambda.mean(dim=-1)[b_mask].mean()
-            ret_std = return_lambda.mean(dim=-1)[b_mask].std()
+            ret_mu = return_lambda.mean(dim=-1)[batch.batch_mask].mean()
+            ret_std = return_lambda.mean(dim=-1)[batch.batch_mask].std()
             return_lambda = (return_lambda - ret_mu) / ret_std
 
         ### 2. Update the critic
         cr_loss = 0
-        for t in range(b_obs.size(1)):
-            b_q_values = critic(
-                state=b_states[:, t], observations=b_obs[:, t], actions=b_actions[:, t]
-            )
-            b_q_values = torch.gather(
-                b_q_values, dim=-1, index=b_actions[:, t].unsqueeze(-1)
-            ).squeeze()
-            q_targets = return_lambda[:, t]
-            critic_loss = F.mse_loss(b_q_values[b_mask[:, t]], q_targets[b_mask[:, t]])
-            cr_loss += critic_loss * b_mask[:, t].sum()
+        for t in range(0, batch.batch_obs.size(1), args.minibatch_size):
+            (
+                mb_obs,
+                mb_action,
+                _,
+                mb_states,
+                _,
+                _,
+                mb_mask,
+            ) = get_mini_batches(batch, t, args.minibatch_size)
+            b_q_values = critic(state=mb_states, observations=mb_obs, actions=mb_action)
+            b_q_values = torch.gather(b_q_values, dim=-1, index=mb_action.unsqueeze(-1))
+            b_q_values = b_q_values.reshape_as(mb_action)
+            q_targets = return_lambda[:, t : t + args.minibatch_size].flatten(0, 1)
+            critic_loss = F.mse_loss(b_q_values[mb_mask], q_targets[mb_mask])
+            cr_loss += critic_loss * (mb_mask.sum())
 
         critic_optimizer.zero_grad()
-        cr_loss = cr_loss / b_mask.sum()
+        cr_loss = cr_loss / batch.batch_mask.sum()
         cr_loss.backward()
         critic_gradients = norm_d([p.grad for p in critic.parameters()], 2)
         if args.clip_gradients > 0:
-            torch.nn.utils.clip_grad_norm_(
-                critic.parameters(), max_norm=args.clip_gradients
-            )
+            torch.nn.utils.clip_grad_norm_(critic.parameters(), max_norm=args.clip_gradients)
         critic_optimizer.step()
-
         training_step += 1
+        # Update target critic
         if training_step % args.target_network_update_freq == 0:
             soft_update(target_net=target_critic, critic_net=critic, polyak=args.polyak)
         ### 3. Update actor
         entropies = 0
         ac_loss = 0
-        for t in range(b_obs.size(1)):
-            pi = actor.logits(b_obs[:, t], avail_action=b_avail_actions[:, t])
+        for t in range(0, batch.batch_obs.size(1), args.minibatch_size):
+            (
+                mb_obs,
+                mb_action,
+                mb_reward,
+                mb_states,
+                mb_avail_action,
+                mb_done,
+                mb_mask,
+            ) = get_mini_batches(batch, t, args.minibatch_size)
+            pi = actor.logits(mb_obs, avail_action=mb_avail_action)
             log_pi = torch.log(pi + 1e-8)
-            entropy_loss = -(pi * log_pi).mean(dim=-1)[b_mask[:, t]]
-            entropy_loss = entropy_loss.sum()
+            entropy_loss = -(pi * log_pi).sum(dim=-1)
+            entropy_loss = entropy_loss[mb_mask].sum()
             entropies += entropy_loss
-            q_values = critic(
-                state=b_states[:, t], observations=b_obs[:, t], actions=b_actions[:, t]
-            )
+            q_values = critic(state=mb_states, observations=mb_obs, actions=mb_action)
             q_values = q_values.clone().detach()
             coma_baseline = pi * q_values
             coma_baseline = coma_baseline.sum(dim=-1)
-            current_q = torch.gather(
-                q_values, dim=-1, index=b_actions[:, t].unsqueeze(-1)
-            ).squeeze()
+            current_q = torch.gather(q_values, dim=-1, index=mb_action.unsqueeze(-1))
+            current_q = current_q.reshape_as(mb_action)
             advantage = (current_q - coma_baseline).detach()
-            if args.normalize_advantage and b_actions[:, t].sum() > eval_env.n_agents:
-                advantage = (advantage - advantage[b_mask[:, t]].mean()) / (
-                    advantage[b_mask[:, t]].std() + 1e-8
+            if args.normalize_advantage:
+                advantage = (advantage - advantage[mb_mask].mean()) / (
+                    advantage[mb_mask].std() + 1e-8
                 )
-            log_pi = torch.gather(
-                log_pi, dim=-1, index=b_actions[:, t].unsqueeze(-1)
-            ).squeeze()
-            actor_loss = (log_pi[b_mask[:, t]] * advantage[b_mask[:, t]]).sum()
+            log_pi = torch.gather(log_pi, dim=-1, index=mb_action.unsqueeze(-1))
+            log_pi = log_pi.reshape_as(mb_action)
+            actor_loss = (log_pi * advantage).sum(-1)[mb_mask].sum()
             actor_loss = -actor_loss - args.entropy_coef * entropy_loss
             ac_loss += actor_loss
         actor_optimizer.zero_grad()
-        ac_loss = ac_loss / b_mask.sum()
-        entropies = entropies / b_mask.sum()
+        ac_loss = ac_loss / batch.batch_mask.sum()
+        entropies = entropies / batch.batch_mask.sum()
         ac_loss.backward()
         actor_gradients = norm_d([p.grad for p in actor.parameters()], 2)
         if args.clip_gradients > 0:
-            torch.nn.utils.clip_grad_norm_(
-                actor.parameters(), max_norm=args.clip_gradients
-            )
+            torch.nn.utils.clip_grad_norm_(actor.parameters(), max_norm=args.clip_gradients)
         actor_optimizer.step()
 
         writer.add_scalar("train/critic_loss", cr_loss, step)
@@ -690,7 +680,6 @@ if __name__ == "__main__":
         writer.add_scalar("train/entropy", entropies, step)
         writer.add_scalar("train/actor_gradients", actor_gradients, step)
         writer.add_scalar("train/critic_gradients", critic_gradients, step)
-        writer.add_scalar("train/epsilon", epsilon, step)
         writer.add_scalar("train/num_updates", training_step, step)
 
         if training_step % args.eval_steps == 0:
@@ -709,9 +698,7 @@ if __name__ == "__main__":
                             eval_env.get_avail_actions(), dtype=torch.bool
                         ).to(device),
                     )
-                next_obs_, reward, done, truncated, infos = eval_env.step(
-                    actions.cpu().numpy()
-                )
+                next_obs_, reward, done, truncated, infos = eval_env.step(actions.cpu().numpy())
                 current_reward += reward
                 current_ep_length += 1
                 eval_obs = next_obs_
@@ -732,6 +719,21 @@ if __name__ == "__main__":
                     np.mean([info["battle_won"] for info in eval_ep_stats]),
                     step,
                 )
+
+    if args.save_model:
+        # Save the weights
+        actor_model_path = f"runs/COMA-multienvs-{run_name}/actor.pt"
+        torch.save(actor.state_dict(), actor_model_path)
+        critic_model_path = f"runs/COMA-multienvs-{run_name}/critic.pt"
+        torch.save(critic.state_dict(), critic_model_path)
+
+        # Save the args
+        import json
+        from dataclasses import asdict
+
+        coma_args_path = f"runs/COMA-multienvs-{run_name}/args.json"
+        with open(coma_args_path, "w") as f:
+            json.dump(asdict(args), f, indent=2)
 
     writer.close()
     if args.use_wnb:

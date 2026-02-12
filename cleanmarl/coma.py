@@ -156,9 +156,7 @@ class RolloutBuffer:
             done[i, :length] = self.episodes[i]["done"]
             mask[i, :length] = 1
         if self.normalize_reward:
-            mu = torch.mean(reward[mask])
-            std = torch.std(reward[mask])
-            reward[mask.bool()] = (reward[mask] - mu) / (std + 1e-6)
+            reward = (reward - reward[mask].mean()) / (reward[mask].std() + 1e-6)
         self.episodes = [None] * self.buffer_size
         return Batch(
             batch_obs=obs.float(),
@@ -182,12 +180,6 @@ class Actor(nn.Module):
         self.layers.append(nn.Sequential(nn.Linear(hidden_dim, output_dim)))
 
     def act(self, x, eps=0, avail_action=None):
-        # for layer in self.layers:
-        #     x = layer(x)
-        # if avail_action is not None:
-        #     x = x.masked_fill(~avail_action, -1e9)
-        # masked_eps = (avail_action) * (eps / avail_action.sum(dim=-1, keepdim=True))
-        # probs = (1 - eps) * F.softmax(x, dim=-1) + masked_eps
         probs = self.logits(x=x, eps=eps, avail_action=avail_action)
         distribution = Categorical(probs)
         action = distribution.sample()
@@ -279,7 +271,9 @@ def get_coma_critic_input_dim(env):
 
 def get_mini_batches(batch, t, minibatch_size):
     return (
-        batch.batch_obs[:, t : t + minibatch_size].flatten(0, 1),
+        batch.batch_obs[:, t : t + minibatch_size].flatten(
+            0, 1
+        ),  # I flatten to be compatible with the critic
         batch.batch_action[:, t : t + minibatch_size].flatten(0, 1),
         batch.batch_reward[:, t : t + minibatch_size].flatten(0, 1),
         batch.batch_states[:, t : t + minibatch_size].flatten(0, 1),
@@ -394,7 +388,6 @@ if __name__ == "__main__":
                         eps=epsilon,
                         avail_action=torch.from_numpy(avail_action).bool().to(device),
                     ).cpu()
-
                 next_obs, reward, done, truncated, infos = env.step(actions.cpu().numpy())
                 ep_reward += reward
                 ep_length += 1
@@ -435,33 +428,6 @@ if __name__ == "__main__":
         batch = rb.get_batch()
         ### 1. Compute TD(λ) using "Reconciling λ-Returns with Experience Replay"(https://arxiv.org/pdf/1810.09967 Equation 3)
         ## This commented lines are a "batch-ed" version of computing λ-Returns
-        # with torch.no_grad():
-        #     return_lambda = torch.zeros_like(b_actions).float().to(device)
-
-        #     for ep_idx in range(return_lambda.size(0)):
-        #         next_action_value = target_critic(
-        #             state=b_states[ep_idx, 1:],
-        #             observations=b_obs[ep_idx, 1:],
-        #             actions=b_actions[ep_idx, 1:],
-        #             avail_actions=b_avail_actions[ep_idx, 1:],
-        #         )
-        #         next_action_value = torch.gather(
-        #             next_action_value, dim=-1, index=b_actions[ep_idx, 1:].unsqueeze(-1)
-        #         ).squeeze()
-        #         next_action_value[~b_mask[ep_idx, 1:]] = 0
-        #         ep_len = b_mask[ep_idx].sum()
-
-        #         next_action_value = torch.cat(
-        #             (next_action_value, torch.zeros((1, env.n_agents)))
-        #         )
-        #         last_return_lambda = 0
-        #         for t in reversed(range(ep_len)):
-        #             return_lambda[ep_idx, t] = last_return_lambda = b_reward[
-        #                 ep_idx, t
-        #             ] + args.gamma * (
-        #                 args.td_lambda * last_return_lambda
-        #                 + (1 - args.td_lambda) * next_action_value[t]
-        #             )
 
         return_lambda = torch.zeros_like(batch.batch_action).float().to(device)
         if args.use_tdlamda:
@@ -479,12 +445,7 @@ if __name__ == "__main__":
                                 actions=batch.batch_action[ep_idx, t + 1],
                                 avail_actions=batch.batch_avail_action[ep_idx, t + 1],
                             )
-                            next_action_value = torch.gather(
-                                next_action_value,
-                                dim=-1,
-                                index=batch.batch_action[ep_idx, t + 1].unsqueeze(-1),
-                            ).squeeze()
-                            # next_action_value, _ = next_action_value.max(dim=-1)
+                            next_action_value, _ = next_action_value.max(dim=-1)
                         return_lambda[ep_idx, t] = last_return_lambda = batch.batch_reward[
                             ep_idx, t
                         ] + args.gamma * (
@@ -527,10 +488,9 @@ if __name__ == "__main__":
             ret_mu = return_lambda.mean(dim=-1)[batch.batch_mask].mean()
             ret_std = return_lambda.mean(dim=-1)[batch.batch_mask].std()
             return_lambda = (return_lambda - ret_mu) / ret_std
-
         ### 2. Update the critic
         cr_loss = 0
-        for k in range(0, batch.batch_obs.size(1), args.minibatch_size):
+        for t in range(0, batch.batch_obs.size(1), args.minibatch_size):
             (
                 mb_obs,
                 mb_action,
@@ -539,10 +499,11 @@ if __name__ == "__main__":
                 _,
                 _,
                 mb_mask,
-            ) = get_mini_batches(batch, k, args.minibatch_size)
+            ) = get_mini_batches(batch, t, args.minibatch_size)
             b_q_values = critic(state=mb_states, observations=mb_obs, actions=mb_action)
-            b_q_values = torch.gather(b_q_values, dim=-1, index=mb_action.unsqueeze(-1)).squeeze()
-            q_targets = return_lambda[:, k : k + args.minibatch_size].flatten(0, 1)
+            b_q_values = torch.gather(b_q_values, dim=-1, index=mb_action.unsqueeze(-1))
+            b_q_values = b_q_values.reshape_as(mb_action)
+            q_targets = return_lambda[:, t : t + args.minibatch_size].flatten(0, 1)
             critic_loss = F.mse_loss(b_q_values[mb_mask], q_targets[mb_mask])
             cr_loss += critic_loss * (mb_mask.sum())
 
@@ -560,7 +521,7 @@ if __name__ == "__main__":
         ### 3. Update actor
         entropies = 0
         ac_loss = 0
-        for k in range(0, batch.batch_obs.size(1), args.minibatch_size):
+        for t in range(0, batch.batch_obs.size(1), args.minibatch_size):
             (
                 mb_obs,
                 mb_action,
@@ -569,24 +530,26 @@ if __name__ == "__main__":
                 mb_avail_action,
                 mb_done,
                 mb_mask,
-            ) = get_mini_batches(batch, k, args.minibatch_size)
+            ) = get_mini_batches(batch, t, args.minibatch_size)
             pi = actor.logits(mb_obs, avail_action=mb_avail_action)
             log_pi = torch.log(pi + 1e-8)
-            entropy_loss = -(pi * log_pi).mean(dim=-1)[mb_mask]
-            entropy_loss = entropy_loss.sum()
+            entropy_loss = -(pi * log_pi).sum(dim=-1)
+            entropy_loss = entropy_loss[mb_mask].sum()
             entropies += entropy_loss
             q_values = critic(state=mb_states, observations=mb_obs, actions=mb_action)
             q_values = q_values.clone().detach()
             coma_baseline = pi * q_values
             coma_baseline = coma_baseline.sum(dim=-1)
-            current_q = torch.gather(q_values, dim=-1, index=mb_action.unsqueeze(-1)).squeeze()
+            current_q = torch.gather(q_values, dim=-1, index=mb_action.unsqueeze(-1))
+            current_q = current_q.reshape_as(mb_action)
             advantage = (current_q - coma_baseline).detach()
             if args.normalize_advantage:
                 advantage = (advantage - advantage[mb_mask].mean()) / (
                     advantage[mb_mask].std() + 1e-8
                 )
-            log_pi = torch.gather(log_pi, dim=-1, index=mb_action.unsqueeze(-1)).squeeze()
-            actor_loss = (log_pi[mb_mask] * advantage[mb_mask]).sum()
+            log_pi = torch.gather(log_pi, dim=-1, index=mb_action.unsqueeze(-1))
+            log_pi = log_pi.reshape_as(mb_action)
+            actor_loss = (log_pi * advantage).sum(-1)[mb_mask].sum()
             actor_loss = -actor_loss - args.entropy_coef * entropy_loss
             ac_loss += actor_loss
         actor_optimizer.zero_grad()

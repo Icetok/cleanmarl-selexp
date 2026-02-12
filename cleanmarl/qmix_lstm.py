@@ -86,7 +86,7 @@ class Qnetwrok(nn.Module):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.fc1 = nn.Sequential(nn.Linear(input_dim, hidden_dim), nn.ReLU())
-        self.gru = nn.LSTM(hidden_dim, hidden_dim, num_layers=1, batch_first=True)
+        self.lstm = nn.LSTM(hidden_dim, hidden_dim, num_layers=1, batch_first=True)
         self.fc2 = nn.Sequential(nn.ReLU(), nn.Linear(hidden_dim, output_dim))
 
     def forward(self, x, h=None, avail_action=None):
@@ -100,7 +100,7 @@ class Qnetwrok(nn.Module):
             x = x.unsqueeze(1)
             if avail_action is not None:
                 avail_action = avail_action.unsqueeze(1)
-        x, h = self.gru(x, h)
+        x, h = self.lstm(x, h)
         x = self.fc2(x)
         if avail_action is not None:
             x = x.masked_fill(~avail_action, float("-inf"))
@@ -211,7 +211,6 @@ class ReplayBuffer:
             mu = reward[mask].mean()
             std = reward[mask].std()
             reward = (reward - mu) / (std + 1e-6)
-
         return Batch(
             batch_obs=obs.float().permute(0, 2, 1, 3),
             batch_action=actions.long().permute(0, 2, 1),
@@ -253,7 +252,9 @@ def soft_update(target_net, utility_net, polyak):
 
 def get_mini_batches(batch, t, minibatch_size):
     return (
-        batch.batch_obs[:, :, t : t + minibatch_size].flatten(0, 1),
+        batch.batch_obs[:, :, t : t + minibatch_size].flatten(
+            0, 1
+        ),  # I flatten so the batch_size = num_envs*num_agents as I cannot batch over the agents as with MLPs
         batch.batch_action[:, :, t : t + minibatch_size].flatten(0, 1),
         batch.batch_reward[:, t : t + minibatch_size],
         batch.batch_next_obs[:, :, t : t + minibatch_size].flatten(0, 1),

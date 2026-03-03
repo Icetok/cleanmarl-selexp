@@ -1,7 +1,6 @@
 # cleanmarl/maddpg_continuous.py
 
 import copy
-import os
 from pathlib import Path
 import datetime
 import random
@@ -24,11 +23,13 @@ from env.vmas_wrapper import VMASWrapper
 # Optional dependency for video writing.
 try:
     import imageio.v2 as imageio
+
     _HAS_IMAGEIO = True
 except Exception:
     imageio = None
     _HAS_IMAGEIO = False
 
+print("[boot] maddpg_continuous.py imported")
 
 # -------------------------
 # Command line arguments
@@ -36,30 +37,38 @@ except Exception:
 @dataclass
 class Args:
     # Environment selection
-    env_type: str = "pz"  # "pz" | "smaclite" | "lbf" | "vmas"
-    env_name: str = "simple_spread_v3"
-    env_family: str = "mpe"
+    env_type: str = "vmas"  # "pz" | "smaclite" | "lbf" | "vmas"
+    env_name: str = "discovery"
+    env_family: str = "vmas"
     agent_ids: bool = True
+
+    # VMAS scenario configuration
+    vmas_n_agents: int = 3
+    vmas_max_steps: int = 200
+    vmas_agents_per_target: int = 1  # agents needed to cover a target (discovery)
+    vmas_covering_range: float = 0.25
+    vmas_n_targets: int = 7
+    vmas_targets_respawn: bool = True
 
     # RL hyperparameters
     gamma: float = 0.99
-    buffer_size: int = 10000      # number of episodes stored (NOT transitions)
-    batch_size: int = 10          # number of episodes sampled for training
+    buffer_size: int = 10000  # number of episodes stored (NOT transitions)
+    batch_size: int = 10  # number of episodes sampled for training
     normalize_reward: bool = True
 
     # Actor network size
-    actor_hidden_dim: int = 64
-    actor_num_layers: int = 1
+    actor_hidden_dim: int = 128
+    actor_num_layers: int = 2
 
     # Critic network size
-    critic_hidden_dim: int = 256
-    critic_num_layers: int = 1
+    critic_hidden_dim: int = 128
+    critic_num_layers: int = 2
 
     # Training / logging
     train_freq: int = 1
     optimizer: str = "Adam"
-    learning_rate_actor: float = 1e-5
-    learning_rate_critic: float = 1e-5
+    learning_rate_actor: float = 5e-5
+    learning_rate_critic: float = 1e-4
     total_timesteps: int = 500000
     target_network_update_freq: int = 1
     polyak: float = 0.005
@@ -69,29 +78,29 @@ class Args:
     num_eval_ep: int = 5
 
     # Exploration noise (continuous)
-    exploration_noise: float = 0.05
+    exploration_noise: float = 0.3
 
     # -------------------------
     # Evaluation rendering / video
     # -------------------------
-    eval_render: bool = False
-    eval_save_video: bool = False
+    eval_render: bool = True
+    eval_save_video: bool = True
     eval_video_dir: str = "eval_videos"
     eval_video_fps: int = 20
-    eval_video_format: str = "gif"   # "gif" or "mp4"
+    eval_video_format: str = "gif"  # "gif" or "mp4"
     eval_video_max_frames: int = 2000
 
     # W&B / device / seed
     use_wnb: bool = False
     wnb_project: str = ""
     wnb_entity: str = ""
-    device: str = "cpu"
+    device: str = "cuda"  # "cpu" | "mps" | "cuda"
     seed: int = 1
 
     # -------------------------
     # "Semantic layer" discarding
     # -------------------------
-    semantic_enabled: bool = True
+    semantic_enabled: bool = False
     semantic_mode: str = "advantage"  # "interaction" | "reward" | "advantage"
     semantic_discard_mode: str = "step"  # "episode" | "step"
     semantic_min_keep_frac: float = 0.05
@@ -108,7 +117,7 @@ class Args:
     # -------------------------
     # Clustering
     # -------------------------
-    cluster_enabled: bool = True
+    cluster_enabled: bool = False
     cluster_mode: str = "proximity"  # "proximity" | "policy" | "hybrid"
     cluster_proximity_radius: float = 0.75
     cluster_policy_dist_thresh: float = 0.25
@@ -163,12 +172,22 @@ class Critic(nn.Module):
         maddpg_inputs = torch.zeros((state.size(0), self.num_agents, self.input_dim), device=state.device)
         maddpg_inputs[:, :, : state.size(-1)] = state.unsqueeze(1)
 
-        # replicate joint actions for each agent head (same structure as your discrete version)
+        # replicate joint actions for each agent head
         oh = actions.unsqueeze(1).expand(-1, self.num_agents, -1, -1).reshape(state.size(0), self.num_agents, -1)
 
         if grad_processing:
-            b_oh = batch_action.unsqueeze(1).expand(-1, self.num_agents, -1, -1).reshape(state.size(0), self.num_agents, -1)
-            mask = torch.eye(self.num_agents, device=state.device).unsqueeze(-1).expand(-1, -1, actions.size(-1)).reshape(self.num_agents, -1)
+            if batch_action is None:
+                raise ValueError("batch_action must be provided when grad_processing=True")
+
+            b_oh = batch_action.unsqueeze(1).expand(-1, self.num_agents, -1, -1).reshape(
+                state.size(0), self.num_agents, -1
+            )
+            mask = (
+                torch.eye(self.num_agents, device=state.device)
+                .unsqueeze(-1)
+                .expand(-1, -1, actions.size(-1))
+                .reshape(self.num_agents, -1)
+            )
             oh = torch.where(mask.bool(), oh, b_oh)
 
         maddpg_inputs[:, :, state.size(-1) :] = oh
@@ -179,20 +198,30 @@ class Critic(nn.Module):
 # Episode-based replay buffer
 # -------------------------
 class ReplayBuffer:
-    def __init__(self, buffer_size, num_agents, obs_space, state_space, action_space, normalize_reward=False, device="cpu"):
-        self.buffer_size = buffer_size
-        self.num_agents = num_agents
-        self.obs_space = obs_space
-        self.state_space = state_space
-        self.action_space = action_space
-        self.normalize_reward = normalize_reward
+    def __init__(
+        self,
+        buffer_size,
+        num_agents,
+        obs_space,
+        state_space,
+        action_space,
+        normalize_reward=False,
+        device="cpu",
+    ):
+        self.buffer_size = int(buffer_size)
+        self.num_agents = int(num_agents)
+        self.obs_space = int(obs_space)
+        self.state_space = int(state_space)
+        self.action_space = int(action_space)
+        self.normalize_reward = bool(normalize_reward)
         self.device = device
 
-        self.episodes = [None] * buffer_size
+        self.episodes = [None] * self.buffer_size
         self.pos = 0
         self.size = 0
 
     def store(self, episode):
+        # episode is a dict of lists of numpy arrays / scalars
         for key, values in episode.items():
             episode[key] = torch.from_numpy(np.stack(values)).float().to(self.device)
         self.episodes[self.pos] = episode
@@ -200,7 +229,10 @@ class ReplayBuffer:
         self.size = min(self.size + 1, self.buffer_size)
 
     def sample(self, batch_size):
-        indices = np.random.randint(0, self.size, size=batch_size)
+        if self.size == 0:
+            raise RuntimeError("ReplayBuffer is empty; cannot sample")
+
+        indices = np.random.randint(0, self.size, size=int(batch_size))
         batch = [self.episodes[i] for i in indices]
         lengths = [len(ep["obs"]) for ep in batch]
         max_length = max(lengths)
@@ -240,18 +272,34 @@ def environment(env_type, env_name, env_family, agent_ids, kwargs):
     if env_type == "lbf":
         return LBFWrapper(map_name=env_name, agent_ids=agent_ids, **kwargs)
     if env_type == "vmas":
+        # copy so we don't mutate caller's dict
+        vmas_kwargs = dict(kwargs)
+
+        # wrapper-level args (consume them)
+        device = vmas_kwargs.pop("device", "cpu")
+        n_agents = vmas_kwargs.pop("n_agents", 3)
+        max_steps = vmas_kwargs.pop("max_steps", 200)
+
+        semantic_enabled = vmas_kwargs.pop("wrapper_semantic_enabled", False)
+        semantic_threshold = vmas_kwargs.pop("semantic_threshold", 0.0)
+        semantic_mode = vmas_kwargs.pop("semantic_mode", "interaction")
+        interaction_radius = vmas_kwargs.pop("interaction_radius", 0.5)
+        interaction_use_inverse_mean_dist = vmas_kwargs.pop("interaction_use_inverse_mean_dist", True)
+
+        # EVERYTHING left in vmas_kwargs now is scenario-specific
         return VMASWrapper(
             scenario=env_name,
-            n_agents=kwargs.get("n_agents", 3),
-            max_steps=kwargs.get("max_steps", 100),
+            n_agents=n_agents,
+            max_steps=max_steps,
             agent_ids=agent_ids,
-            device=kwargs.get("device", "cpu"),
-            continuous_actions=True,  # IMPORTANT: continuous
-            semantic_enabled=kwargs.get("wrapper_semantic_enabled", False),
-            semantic_threshold=kwargs.get("semantic_threshold", 0.0),
-            semantic_mode=kwargs.get("semantic_mode", "interaction"),
-            interaction_radius=kwargs.get("interaction_radius", 0.5),
-            interaction_use_inverse_mean_dist=kwargs.get("interaction_use_inverse_mean_dist", True),
+            device=device,
+            continuous_actions=True,
+            semantic_enabled=semantic_enabled,
+            semantic_threshold=semantic_threshold,
+            semantic_mode=semantic_mode,
+            interaction_radius=interaction_radius,
+            interaction_use_inverse_mean_dist=interaction_use_inverse_mean_dist,
+            **vmas_kwargs,
         )
     raise ValueError(f"Unknown env_type: {env_type}")
 
@@ -308,7 +356,6 @@ def _strip_agent_ids(obs_with_ids: np.ndarray, n_agents: int, agent_ids: bool) -
 
 
 def _pairwise_l2_distance(X: np.ndarray) -> np.ndarray:
-    # X: (N, D)
     diffs = X[:, None, :] - X[None, :, :]
     return np.linalg.norm(diffs, axis=-1).astype(np.float32)
 
@@ -336,8 +383,8 @@ def _connected_components_from_adjacency(adj: np.ndarray) -> list[list[int]]:
 
 
 def _build_clusters_continuous(
-    obs_base: np.ndarray,            # (N, obs_dim_base)
-    policy_vecs: np.ndarray,         # (N, act_dim) e.g. current actor outputs or rolling mean actions
+    obs_base: np.ndarray,
+    policy_vecs: np.ndarray,
     mode: str,
     prox_radius: float,
     policy_dist_thresh: float,
@@ -345,17 +392,15 @@ def _build_clusters_continuous(
     n = policy_vecs.shape[0]
     mode = (mode or "proximity").lower().strip()
 
-    # policy distance edges via L2 distance in action space
-    Dpol = _pairwise_l2_distance(policy_vecs)  # (N,N)
-    policy_edges = (Dpol <= float(policy_dist_thresh))
+    Dpol = _pairwise_l2_distance(policy_vecs)
+    policy_edges = Dpol <= float(policy_dist_thresh)
 
-    # proximity edges (if obs contains 2D positions)
     prox_edges = np.zeros((n, n), dtype=bool)
     if obs_base.ndim == 2 and obs_base.shape[1] >= 2:
         pos = obs_base[:, :2].astype(np.float32, copy=False)
         diffs = pos[:, None, :] - pos[None, :, :]
         dists = np.linalg.norm(diffs, axis=-1)
-        prox_edges = (dists <= float(prox_radius))
+        prox_edges = dists <= float(prox_radius)
 
     if mode == "policy":
         adj = policy_edges
@@ -364,7 +409,6 @@ def _build_clusters_continuous(
     else:
         adj = prox_edges if prox_edges.any() else policy_edges
 
-    # always include self-edges
     adj = adj | np.eye(n, dtype=bool)
 
     clusters = _connected_components_from_adjacency(adj)
@@ -389,19 +433,15 @@ def _shannon_entropy_of_cluster_sizes(clusters: list[list[int]], n_agents: int, 
 
 
 def _compute_advantage_per_agent_continuous(critic, actor, obs_np, state_np, actions_taken_np, device, act_low_t, act_high_t):
-    # obs_np: (N, obs_dim)
-    # state_np: (state_dim,)
-    # actions_taken_np: (N, act_dim)
-    obs_t = torch.from_numpy(obs_np).float().to(device)                           # (N, obs_dim)
-    state_t = torch.from_numpy(state_np).float().to(device).unsqueeze(0)          # (1, state_dim)
-
-    a_taken = torch.from_numpy(actions_taken_np).float().to(device).unsqueeze(0)  # (1, N, act_dim)
+    obs_t = torch.from_numpy(obs_np).float().to(device)
+    state_t = torch.from_numpy(state_np).float().to(device).unsqueeze(0)
+    a_taken = torch.from_numpy(actions_taken_np).float().to(device).unsqueeze(0)
 
     with torch.no_grad():
-        a_pi = actor.act(obs_t).unsqueeze(0)                                      # (1, N, act_dim)
+        a_pi = actor.act(obs_t).unsqueeze(0)
         a_pi = torch.clamp(a_pi, act_low_t, act_high_t)
 
-        q_taken = critic(state_t, a_taken)                                        # (1, N) or (N,)
+        q_taken = critic(state_t, a_taken)
         q_pi = critic(state_t, a_pi)
 
         if q_taken.ndim == 1:
@@ -409,7 +449,7 @@ def _compute_advantage_per_agent_continuous(critic, actor, obs_np, state_np, act
         if q_pi.ndim == 1:
             q_pi = q_pi.unsqueeze(0)
 
-        adv = (q_taken - q_pi).reshape(-1)                                        # (N,)
+        adv = (q_taken - q_pi).reshape(-1)
         abs_adv = torch.abs(adv).detach().cpu().numpy().astype(np.float32)
 
     return abs_adv
@@ -459,6 +499,7 @@ def _maybe_write_video(frames, out_path: Path, fps: int, fmt: str):
 # Main training loop
 # -------------------------
 if __name__ == "__main__":
+    print("[boot] entering main")
     args = tyro.cli(Args)
 
     # Reproducibility
@@ -466,6 +507,8 @@ if __name__ == "__main__":
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+
+    # Device
     device = torch.device(args.device)
 
     # Env kwargs: VMAS wrapper semantics only used for interaction/reward
@@ -474,12 +517,20 @@ if __name__ == "__main__":
         wrapper_semantic_enabled = args.semantic_enabled and (args.semantic_mode in ("interaction", "reward"))
         kwargs = {
             "device": args.device,
+            "n_agents": args.vmas_n_agents,
+            "max_steps": args.vmas_max_steps,
             "wrapper_semantic_enabled": wrapper_semantic_enabled,
-            "semantic_mode": args.semantic_mode if wrapper_semantic_enabled else "interaction",
+            "semantic_mode": (args.semantic_mode if wrapper_semantic_enabled else "interaction"),
             "semantic_threshold": 0.0,
+            # VMAS scenario-specific kwargs (forwarded to vmas.make_env)
+            "agents_per_target": args.vmas_agents_per_target,
+            "covering_range": args.vmas_covering_range,
+            "n_targets": args.vmas_n_targets,
+            "targets_respawn": args.vmas_targets_respawn,
         }
 
     env = environment(args.env_type, args.env_name, args.env_family, args.agent_ids, kwargs)
+    print("[sanity] n_agents:", env.n_agents, "obs_size:", env.get_obs_size(), "state_size:", env.get_state_size())
     eval_env = environment(args.env_type, args.env_name, args.env_family, args.agent_ids, kwargs)
 
     # Determine action bounds
@@ -487,7 +538,6 @@ if __name__ == "__main__":
         act_low_t = torch.from_numpy(np.asarray(env.act_low, dtype=np.float32)).to(device)
         act_high_t = torch.from_numpy(np.asarray(env.act_high, dtype=np.float32)).to(device)
     else:
-        # fallback: assume [-1, 1] box
         act_dim = env.get_action_size()
         act_low_t = torch.full((act_dim,), -1.0, device=device)
         act_high_t = torch.full((act_dim,), 1.0, device=device)
@@ -508,6 +558,7 @@ if __name__ == "__main__":
 
     if args.use_wnb:
         import wandb
+
         wandb.init(
             project=args.wnb_project,
             entity=args.wnb_entity,
@@ -532,11 +583,10 @@ if __name__ == "__main__":
         device=device,
     )
 
-    # Per-cluster alpha tracking
+    # Per-cluster alpha tracking (only used if semantic advantage gating is enabled)
     cluster_score_windows: dict[tuple, deque] = {}
     cluster_alpha: dict[tuple, float] = {}
 
-    # For continuous "policy distance": keep rolling action vectors per agent
     action_hist = [deque(maxlen=int(args.cluster_action_hist_window)) for _ in range(env.n_agents)]
 
     # Rollout metrics
@@ -565,6 +615,11 @@ if __name__ == "__main__":
             obs, _ = env.reset(seed=args.seed)
         except TypeError:
             obs, _ = env.reset()
+            
+        if num_episode == 0:
+            print("obs shape:", obs.shape, "min/max:", obs.min(), obs.max())
+            st = env.get_state()
+            print("state shape:", st.shape, "min/max:", st.min(), st.max())
 
         ep_reward, ep_length = 0.0, 0
         done, truncated = False, False
@@ -594,8 +649,6 @@ if __name__ == "__main__":
                 if args.semantic_mode == "advantage":
                     obs_base = _strip_agent_ids(obs, env.n_agents, args.agent_ids)
 
-                    # policy vectors for clustering:
-                    # use rolling mean action per agent (more stable than single step)
                     policy_vecs = np.zeros((env.n_agents, env.get_action_size()), dtype=np.float32)
                     for i in range(env.n_agents):
                         if len(action_hist[i]) == 0:
@@ -631,7 +684,6 @@ if __name__ == "__main__":
                         cluster_key = tuple(sorted(comp))
                         cluster_scores[cluster_key] = float(np.mean(abs_adv[np.asarray(comp, dtype=np.int64)]))
 
-                    # update per-cluster alpha
                     for cluster_key, score in cluster_scores.items():
                         if cluster_key not in cluster_score_windows:
                             cluster_score_windows[cluster_key] = deque(maxlen=int(args.adv_alpha_window))
@@ -654,10 +706,7 @@ if __name__ == "__main__":
                     if step < args.adv_warmup_steps:
                         semantic_keep = True
                     else:
-                        passed = [
-                            float(score) >= float(cluster_alpha.get(cluster_key, 0.0))
-                            for cluster_key, score in cluster_scores.items()
-                        ]
+                        passed = [float(score) >= float(cluster_alpha.get(cluster_key, 0.0)) for cluster_key, score in cluster_scores.items()]
                         semantic_keep = bool(all(passed)) if args.cluster_keep_rule == "all" else bool(any(passed))
 
                     semantic_score = float(np.mean(abs_adv))
@@ -665,14 +714,12 @@ if __name__ == "__main__":
                     last_num_clusters = float(len(clusters))
                     last_mean_policy_dist = float(cstats["mean_pairwise_policy_dist"])
                 else:
-                    # interaction/reward semantic score comes from wrapper
                     semantic_score = float(infos.get("semantic_score", 0.0))
                     semantic_keep = bool(infos.get("semantic_keep", True))
             else:
                 semantic_score = 0.0
                 semantic_keep = True
 
-            # bookkeeping
             ep_reward += float(reward)
             ep_length += 1
             step += 1
@@ -694,7 +741,6 @@ if __name__ == "__main__":
         num_episode += 1
         ep_rewards.append(ep_reward)
         ep_lengths.append(ep_length)
-
         if args.env_type == "smaclite":
             ep_stats.append(infos)
 
@@ -746,36 +792,46 @@ if __name__ == "__main__":
                 writer.add_scalar("cluster/mean_pairwise_policy_dist", float(last_mean_policy_dist), step)
 
         # -------------------------
-        # Training step
+        # Training step (Antonio: vectorize over time/batch, avoid Python loop over episode)
         # -------------------------
         if num_episode > args.batch_size and (num_episode % args.train_freq == 0):
             batch_obs, batch_action, batch_reward, batch_states, batch_done, batch_mask = rb.sample(args.batch_size)
 
-            # critic update
-            critic_loss = 0.0
-            for t in range(batch_obs.size(1)):
-                with torch.no_grad():
-                    if t == batch_obs.size(1) - 1:
-                        targets = batch_reward[:, t].unsqueeze(-1).expand(-1, env.n_agents)
-                    else:
-                        a_next = target_actor.act(batch_obs[:, t + 1])
-                        a_next = torch.clamp(a_next, act_low_t, act_high_t)
-                        q_next = target_critic(batch_states[:, t + 1], a_next)
-                        q_next = torch.nan_to_num(q_next, nan=0.0)
+            B, T = batch_obs.shape[:2]
+            N = env.n_agents
 
-                        targets = (
-                            batch_reward[:, t].unsqueeze(-1).expand(-1, env.n_agents)
-                            + args.gamma
-                            * (1 - batch_done[:, t].unsqueeze(-1).expand(-1, env.n_agents))
-                            * q_next
-                        )
+            # Flatten (B,T,...) -> (B*T,...)
+            obs_flat = batch_obs.view(B * T, N, -1)
+            action_flat = batch_action.view(B * T, N, -1)
+            states_flat = batch_states.view(B * T, -1)
 
-                q_values = critic(batch_states[:, t], batch_action[:, t])
-                critic_loss = critic_loss + (
-                    F.mse_loss(targets[batch_mask[:, t]], q_values[batch_mask[:, t]]) * batch_mask[:, t].sum()
-                )
+            # Next values: shift by 1 along time
+            obs_next = torch.roll(batch_obs, shifts=-1, dims=1)
+            states_next = torch.roll(batch_states, shifts=-1, dims=1)
+            obs_next_flat = obs_next.view(B * T, N, -1)
+            states_next_flat = states_next.view(B * T, -1)
 
-            critic_loss = critic_loss / batch_mask.sum()
+            # Critic update
+            with torch.no_grad():
+                a_next_flat = target_actor.act(obs_next_flat)
+                a_next_flat = torch.clamp(a_next_flat, act_low_t, act_high_t)
+
+                q_next_flat = target_critic(states_next_flat, a_next_flat)
+                q_next_flat = torch.nan_to_num(q_next_flat, nan=0.0)
+                q_next = q_next_flat.view(B, T, N)
+
+                expanded_reward = batch_reward.unsqueeze(-1).expand(-1, -1, N)
+                expanded_done = batch_done.unsqueeze(-1).expand(-1, -1, N)
+
+                targets = expanded_reward + args.gamma * (1 - expanded_done) * q_next
+                targets[:, -1, :] = expanded_reward[:, -1, :]
+
+            q_values_flat = critic(states_flat, action_flat)
+            q_values = q_values_flat.view(B, T, N)
+
+            expanded_mask = batch_mask.unsqueeze(-1).expand(-1, -1, N)
+
+            critic_loss = F.mse_loss(q_values[expanded_mask], targets[expanded_mask])
 
             critic_optimizer.zero_grad()
             critic_loss.backward()
@@ -784,15 +840,14 @@ if __name__ == "__main__":
                 torch.nn.utils.clip_grad_norm_(critic.parameters(), max_norm=args.clip_gradients)
             critic_optimizer.step()
 
-            # actor update
-            actor_loss = 0.0
-            for t in range(batch_obs.size(1)):
-                a_pi = actor.act(batch_obs[:, t])
-                a_pi = torch.clamp(a_pi, act_low_t, act_high_t)
-                qvals = critic(batch_states[:, t], a_pi, grad_processing=True, batch_action=batch_action[:, t])
-                actor_loss = actor_loss - qvals[batch_mask[:, t]].sum()
+            # Actor update
+            a_pi_flat = actor.act(obs_flat)
+            a_pi_flat = torch.clamp(a_pi_flat, act_low_t, act_high_t)
 
-            actor_loss = actor_loss / batch_mask.sum()
+            qvals_pi_flat = critic(states_flat, a_pi_flat, grad_processing=True, batch_action=action_flat)
+            qvals_pi = qvals_pi_flat.view(B, T, N)
+
+            actor_loss = -qvals_pi[expanded_mask].sum() / batch_mask.sum()
 
             actor_optimizer.zero_grad()
             actor_loss.backward()
@@ -860,6 +915,7 @@ if __name__ == "__main__":
     writer.close()
     if args.use_wnb:
         import wandb
+
         wandb.finish()
     env.close()
     eval_env.close()

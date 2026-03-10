@@ -32,8 +32,8 @@ print("[boot] maddpg_continuous.py imported")
 @dataclass
 class Args:
     # Environment selection
-    env_type: str = "vmas"  # "pz" | "smaclite" | "lbf" | "vmas"
-    env_name: str = "balance"  # start with balance for sanity checks
+    env_type: str = "vmas"
+    env_name: str = "balance"
     env_family: str = "vmas"
     agent_ids: bool = True
 
@@ -41,7 +41,7 @@ class Args:
     vmas_num_envs: int = 32
 
     # -------------------------
-    # VMAS balance config (BenchMARL-style sanity check)
+    # VMAS balance config
     # -------------------------
     vmas_max_steps: int = 100
     vmas_n_agents: int = 4
@@ -49,7 +49,7 @@ class Args:
     vmas_package_mass: float = 5.0
 
     # -------------------------
-    # VMAS discovery config (BenchMARL-style)
+    # VMAS discovery config
     # -------------------------
     vmas_n_targets: int = 7
     vmas_lidar_range: float = 0.35
@@ -57,7 +57,7 @@ class Args:
     vmas_agents_per_target: int = 2
     vmas_targets_respawn: bool = True
     vmas_shared_reward: bool = True
-    vmas_agent_collision_penalty: float = 0.0  # try small negative values if supported
+    vmas_agent_collision_penalty: float = 0.0
 
     # RL hyperparameters
     gamma: float = 0.99
@@ -65,17 +65,18 @@ class Args:
     batch_size: int = 256
     normalize_reward: bool = True
 
-    # Actor network size
+    # Actor network
     actor_hidden_dim: int = 128
     actor_num_layers: int = 2
 
-    # Critic network size
+    # Critic network
     critic_hidden_dim: int = 128
     critic_num_layers: int = 2
 
     # Training / logging
+    learning_starts: int = 5000
     train_freq: int = 1
-    updates_per_step: int = 1
+    updates_per_step: int = 4
     optimizer: str = "Adam"
     learning_rate_actor: float = 5e-5
     learning_rate_critic: float = 1e-4
@@ -84,59 +85,51 @@ class Args:
     polyak: float = 0.005
     clip_gradients: float = 1.0
     log_every: int = 10
-    eval_steps: int = 50
+    eval_steps: int = 5000
     num_eval_ep: int = 5
 
-    # Exploration schedule (replaces fixed exploration noise)
+    # Exploration schedule
     exploration_noise_start: float = 0.3
     exploration_noise_end: float = 0.05
     exploration_anneal_frac: float = 0.5
 
-    # -------------------------
     # Evaluation rendering / video
-    # -------------------------
     eval_render: bool = False
     eval_save_video: bool = False
     eval_video_dir: str = "eval_videos"
     eval_video_fps: int = 20
-    eval_video_format: str = "mp4"  # "gif" or "mp4"
+    eval_video_format: str = "mp4"
     eval_video_max_frames: int = 2000
 
     # W&B / device / seed
     use_wnb: bool = False
     wnb_project: str = ""
     wnb_entity: str = ""
-    device: str = "cuda"  # "cpu" | "mps" | "cuda"
+    device: str = "cuda"
     seed: int = 1
 
-    # -------------------------
-    # "Semantic layer" discarding / selection
-    # -------------------------
+    # Semantic selection
     semantic_enabled: bool = False
-    semantic_mode: str = "advantage"  # "interaction" | "reward" | "advantage"
+    semantic_mode: str = "advantage"
     semantic_log_every: int = 50
 
-    # soft discard / sampling
+    # soft discard / second-stage sampling
     semantic_sampling_enabled: bool = True
     semantic_candidate_multiplier: int = 4
     semantic_priority_fraction: float = 0.5
 
-    # -------------------------
-    # Advantage-based gating details
-    # -------------------------
+    # advantage gating
     adv_keep_frac: float = 0.2
     adv_alpha_ema_beta: float = 0.9
     adv_alpha_window: int = 5000
     adv_warmup_steps: int = 5000
 
-    # -------------------------
-    # Clustering
-    # -------------------------
+    # clustering
     cluster_enabled: bool = False
-    cluster_mode: str = "proximity"  # "proximity" | "policy" | "hybrid"
+    cluster_mode: str = "proximity"
     cluster_proximity_radius: float = 0.75
     cluster_policy_dist_thresh: float = 0.25
-    cluster_keep_rule: str = "any"  # "all" | "any"
+    cluster_keep_rule: str = "any"
 
 
 # -------------------------
@@ -180,8 +173,6 @@ class Critic(nn.Module):
         return x.squeeze(-1)  # (B, N)
 
     def maddpg_inputs(self, state, actions, grad_processing, batch_action):
-        # state: (B, state_dim)
-        # actions: (B, N, act_dim)
         maddpg_inputs = torch.zeros((state.size(0), self.num_agents, self.input_dim), device=state.device)
         maddpg_inputs[:, :, : state.size(-1)] = state.unsqueeze(1)
 
@@ -203,7 +194,7 @@ class Critic(nn.Module):
             )
             joint_actions = torch.where(mask.bool(), joint_actions, batch_joint)
 
-        maddpg_inputs[:, :, state.size(-1) :] = joint_actions
+        maddpg_inputs[:, :, state.size(-1):] = joint_actions
         return maddpg_inputs
 
 
@@ -237,14 +228,12 @@ class ReplayBuffer:
         self.next_states = np.zeros((self.buffer_size, self.state_space), dtype=np.float32)
         self.dones = np.zeros((self.buffer_size,), dtype=np.float32)
 
-        # soft discard / second-stage sample
         self.keep_mask = np.ones((self.buffer_size,), dtype=bool)
         self.semantic_score = np.zeros((self.buffer_size,), dtype=np.float32)
 
         self.pos = 0
         self.size = 0
 
-        # running reward stats for scaling (NO mean subtraction)
         self.reward_count = 0
         self.reward_sum = 0.0
         self.reward_sq_sum = 0.0
@@ -331,11 +320,8 @@ class ReplayBuffer:
 
         batch_size = int(batch_size)
         candidate_size = min(self.size, max(batch_size, batch_size * int(candidate_multiplier)))
-
-        # 1) first-stage random sampling
         candidate_idx = np.random.randint(0, self.size, size=candidate_size)
 
-        # 2) second-stage selection using keep mask
         if semantic_sampling_enabled:
             keep_candidates = candidate_idx[self.keep_mask[candidate_idx]]
             non_keep_candidates = candidate_idx[~self.keep_mask[candidate_idx]]
@@ -386,21 +372,6 @@ class ReplayBuffer:
 # Environment factory
 # -------------------------
 def environment(env_type, env_name, env_family, agent_ids, kwargs):
-    if env_type == "pz":
-        from env.pettingzoo_wrapper import PettingZooWrapper
-
-        return PettingZooWrapper(family=env_family, env_name=env_name, agent_ids=agent_ids, **kwargs)
-
-    if env_type == "smaclite":
-        from env.smaclite_wrapper import SMACliteWrapper
-
-        return SMACliteWrapper(map_name=env_name, agent_ids=agent_ids, **kwargs)
-
-    if env_type == "lbf":
-        from env.lbf import LBFWrapper
-
-        return LBFWrapper(map_name=env_name, agent_ids=agent_ids, **kwargs)
-
     if env_type == "vmas":
         vmas_kwargs = dict(kwargs)
 
@@ -435,7 +406,7 @@ def environment(env_type, env_name, env_family, agent_ids, kwargs):
 
 
 # -------------------------
-# Utility: gradient norm
+# Utility
 # -------------------------
 def norm_d(grads, d):
     norms = [torch.linalg.vector_norm(g.detach(), d) for g in grads if g is not None]
@@ -444,9 +415,6 @@ def norm_d(grads, d):
     return torch.linalg.vector_norm(torch.tensor(norms), d)
 
 
-# -------------------------
-# Utility: Polyak update
-# -------------------------
 def soft_update(target_net, utility_net, polyak):
     for target_param, param in zip(target_net.parameters(), utility_net.parameters()):
         target_param.data.copy_(polyak * param.data + (1.0 - polyak) * target_param.data)
@@ -576,6 +544,9 @@ def _compute_advantage_per_agent_continuous(
     return abs_adv
 
 
+# -------------------------
+# Video / schedules
+# -------------------------
 def _as_uint8_rgb(frame: np.ndarray) -> np.ndarray:
     if frame is None:
         return None
@@ -648,7 +619,6 @@ def _build_vmas_kwargs(args: Args, num_envs: int) -> dict:
                 "shared_reward": bool(args.vmas_shared_reward),
             }
         )
-        # optional collision penalty: only pass for discovery
         if args.vmas_agent_collision_penalty != 0.0:
             kwargs["agent_collision_penalty"] = float(args.vmas_agent_collision_penalty)
 
@@ -664,13 +634,106 @@ def _build_vmas_kwargs(args: Args, num_envs: int) -> dict:
 
 
 # -------------------------
+# Single training update
+# -------------------------
+def _do_training_updates(
+    args,
+    rb,
+    actor,
+    critic,
+    target_actor,
+    target_critic,
+    actor_optimizer,
+    critic_optimizer,
+    action_scale,
+    action_bias,
+    device,
+    step,
+    writer,
+    num_updates,
+):
+    last_actor_loss = None
+    last_critic_loss = None
+    last_actor_grad = None
+    last_critic_grad = None
+
+    for _ in range(int(args.updates_per_step)):
+        (
+            batch_obs,
+            batch_action,
+            batch_reward,
+            batch_next_obs,
+            batch_states,
+            batch_next_states,
+            batch_done,
+            batch_keep,
+            batch_semantic_score,
+        ) = rb.sample(
+            batch_size=args.batch_size,
+            semantic_sampling_enabled=(args.semantic_enabled and args.semantic_sampling_enabled),
+            candidate_multiplier=args.semantic_candidate_multiplier,
+            priority_fraction=args.semantic_priority_fraction,
+        )
+
+        with torch.no_grad():
+            a_next = action_scale * torch.tanh(target_actor.act(batch_next_obs)) + action_bias
+            q_next = target_critic(batch_next_states, a_next)
+            q_next = torch.nan_to_num(q_next, nan=0.0)
+
+            expanded_reward = batch_reward.unsqueeze(-1).expand(-1, critic.num_agents)
+            expanded_done = batch_done.unsqueeze(-1).expand(-1, critic.num_agents)
+            targets = expanded_reward + args.gamma * (1 - expanded_done) * q_next
+
+        q_values = critic(batch_states, batch_action)
+        critic_loss = F.mse_loss(q_values, targets)
+
+        critic_optimizer.zero_grad()
+        critic_loss.backward()
+        critic_gradients = norm_d([p.grad for p in critic.parameters()], 2)
+        if args.clip_gradients > 0:
+            torch.nn.utils.clip_grad_norm_(critic.parameters(), max_norm=args.clip_gradients)
+        critic_optimizer.step()
+
+        a_pi = action_scale * torch.tanh(actor.act(batch_obs)) + action_bias
+        qvals_pi = critic(batch_states, a_pi, grad_processing=True, batch_action=batch_action)
+        actor_loss = -qvals_pi.mean()
+
+        actor_optimizer.zero_grad()
+        actor_loss.backward()
+        actor_gradients = norm_d([p.grad for p in actor.parameters()], 2)
+        if args.clip_gradients > 0:
+            torch.nn.utils.clip_grad_norm_(actor.parameters(), max_norm=args.clip_gradients)
+        actor_optimizer.step()
+
+        num_updates += 1
+
+        if num_updates % args.target_network_update_freq == 0:
+            soft_update(target_net=target_actor, utility_net=actor, polyak=args.polyak)
+            soft_update(target_net=target_critic, utility_net=critic, polyak=args.polyak)
+
+        last_actor_loss = actor_loss
+        last_critic_loss = critic_loss
+        last_actor_grad = actor_gradients
+        last_critic_grad = critic_gradients
+
+    if last_actor_loss is not None:
+        writer.add_scalar("train/critic_loss", float(last_critic_loss.detach().cpu().item()), step)
+        writer.add_scalar("train/actor_loss", float(last_actor_loss.detach().cpu().item()), step)
+        writer.add_scalar("train/actor_gradients", float(last_actor_grad.detach().cpu().item()), step)
+        writer.add_scalar("train/critic_gradients", float(last_critic_grad.detach().cpu().item()), step)
+        writer.add_scalar("train/num_updates", num_updates, step)
+        writer.add_scalar("train/reward_std_running", float(rb.reward_std), step)
+
+    return num_updates
+
+
+# -------------------------
 # Main training loop
 # -------------------------
 if __name__ == "__main__":
     print("[boot] entering main")
     args = tyro.cli(Args)
 
-    # Reproducibility
     seed = args.seed
     random.seed(seed)
     np.random.seed(seed)
@@ -695,7 +758,14 @@ if __name__ == "__main__":
         env.get_state_size(),
     )
 
-    # Determine action bounds
+    init_obs, _ = env.reset(seed=args.seed)
+    init_states = env.get_state()
+    rounded_states = np.round(init_states, 6)
+    unique_states = np.unique(rounded_states, axis=0).shape[0]
+    print(f"[sanity] unique initial states: {unique_states}/{env.num_envs}")
+    if unique_states < env.num_envs:
+        print("[warn] Some VMAS vector envs appear identical at reset.")
+
     if hasattr(env, "act_low") and hasattr(env, "act_high"):
         act_low_t = torch.from_numpy(np.asarray(env.act_low, dtype=np.float32)).to(device)
         act_high_t = torch.from_numpy(np.asarray(env.act_high, dtype=np.float32)).to(device)
@@ -753,24 +823,21 @@ if __name__ == "__main__":
 
     ep_rewards, ep_lengths = [], []
     num_episode, num_updates, step = 0, 0, 0
+    collector_step = 0
 
     semantic_total_steps = 0
     semantic_kept_steps = 0
 
     next_eval_step = int(args.eval_steps)
 
+    obs, _ = env.reset(seed=args.seed)
+
+    if step < 5:
+        print("obs shape:", obs.shape, "min/max:", float(obs.min()), float(obs.max()))
+        st = env.get_state()
+        print("state shape:", st.shape, "min/max:", float(st.min()), float(st.max()))
+
     while step < args.total_timesteps:
-        try:
-            obs, _ = env.reset(seed=args.seed + num_episode)
-        except TypeError:
-            obs, _ = env.reset()
-
-        # obs shape: (E, N, O)
-        if num_episode == 0:
-            print("obs shape:", obs.shape, "min/max:", float(obs.min()), float(obs.max()))
-            st = env.get_state()
-            print("state shape:", st.shape, "min/max:", float(st.min()), float(st.max()))
-
         env_batch = obs.shape[0]
         done_env = np.zeros((env_batch,), dtype=bool)
         ep_reward = np.zeros((env_batch,), dtype=np.float32)
@@ -781,11 +848,11 @@ if __name__ == "__main__":
         last_mean_policy_dist = 0.0
 
         while not bool(np.all(done_env)) and step < args.total_timesteps:
-            state = env.get_state()  # (E, state_dim)
+            state = env.get_state()
 
-            obs_t = torch.from_numpy(obs).float().to(device)  # (E, N, O)
+            obs_t = torch.from_numpy(obs).float().to(device)
             with torch.no_grad():
-                raw_action = actor.act(obs_t)  # (E, N, A)
+                raw_action = actor.act(obs_t)
                 a_det = action_scale * torch.tanh(raw_action) + action_bias
 
                 sigma = _noise_schedule(
@@ -804,7 +871,6 @@ if __name__ == "__main__":
 
             next_obs, reward, done, truncated, infos = env.step(actions_np)
 
-            # reward, done, truncated are vectors of shape (E,)
             reward = np.asarray(reward, dtype=np.float32).reshape(-1)
             done = np.asarray(done, dtype=bool).reshape(-1)
             truncated = np.asarray(truncated, dtype=bool).reshape(-1)
@@ -907,81 +973,36 @@ if __name__ == "__main__":
 
             done_env = np.logical_or(done_env, terminal)
             obs = next_obs
+
             step += int(env_batch)
+            collector_step += 1
 
-            # -------------------------
-            # Training step
-            # -------------------------
-            enough_data = rb.size >= max(args.batch_size, 1000)
-            if enough_data and (num_episode % args.train_freq == 0):
-                for _ in range(int(args.updates_per_step)):
-                    (
-                        batch_obs,
-                        batch_action,
-                        batch_reward,
-                        batch_next_obs,
-                        batch_states,
-                        batch_next_states,
-                        batch_done,
-                        batch_keep,
-                        batch_semantic_score,
-                    ) = rb.sample(
-                        batch_size=args.batch_size,
-                        semantic_sampling_enabled=(args.semantic_enabled and args.semantic_sampling_enabled),
-                        candidate_multiplier=args.semantic_candidate_multiplier,
-                        priority_fraction=args.semantic_priority_fraction,
-                    )
+            enough_data = rb.size >= max(args.batch_size, args.learning_starts)
+            if enough_data and (collector_step % args.train_freq == 0):
+                num_updates = _do_training_updates(
+                    args=args,
+                    rb=rb,
+                    actor=actor,
+                    critic=critic,
+                    target_actor=target_actor,
+                    target_critic=target_critic,
+                    actor_optimizer=actor_optimizer,
+                    critic_optimizer=critic_optimizer,
+                    action_scale=action_scale,
+                    action_bias=action_bias,
+                    device=device,
+                    step=step,
+                    writer=writer,
+                    num_updates=num_updates,
+                )
 
-                    # critic update
-                    with torch.no_grad():
-                        a_next = action_scale * torch.tanh(target_actor.act(batch_next_obs)) + action_bias
-                        q_next = target_critic(batch_next_states, a_next)
-                        q_next = torch.nan_to_num(q_next, nan=0.0)
-
-                        expanded_reward = batch_reward.unsqueeze(-1).expand(-1, env.n_agents)
-                        expanded_done = batch_done.unsqueeze(-1).expand(-1, env.n_agents)
-                        targets = expanded_reward + args.gamma * (1 - expanded_done) * q_next
-
-                    q_values = critic(batch_states, batch_action)
-                    critic_loss = F.mse_loss(q_values, targets)
-
-                    critic_optimizer.zero_grad()
-                    critic_loss.backward()
-                    critic_gradients = norm_d([p.grad for p in critic.parameters()], 2)
-                    if args.clip_gradients > 0:
-                        torch.nn.utils.clip_grad_norm_(critic.parameters(), max_norm=args.clip_gradients)
-                    critic_optimizer.step()
-
-                    # actor update
-                    a_pi = action_scale * torch.tanh(actor.act(batch_obs)) + action_bias
-                    qvals_pi = critic(batch_states, a_pi, grad_processing=True, batch_action=batch_action)
-                    actor_loss = -qvals_pi.mean()
-
-                    actor_optimizer.zero_grad()
-                    actor_loss.backward()
-                    actor_gradients = norm_d([p.grad for p in actor.parameters()], 2)
-                    if args.clip_gradients > 0:
-                        torch.nn.utils.clip_grad_norm_(actor.parameters(), max_norm=args.clip_gradients)
-                    actor_optimizer.step()
-
-                    num_updates += 1
-
-                writer.add_scalar("train/critic_loss", float(critic_loss.detach().cpu().item()), step)
-                writer.add_scalar("train/actor_loss", float(actor_loss.detach().cpu().item()), step)
-                writer.add_scalar("train/actor_gradients", float(actor_gradients.detach().cpu().item()), step)
-                writer.add_scalar("train/critic_gradients", float(critic_gradients.detach().cpu().item()), step)
-                writer.add_scalar("train/num_updates", num_updates, step)
-                writer.add_scalar("train/reward_std_running", float(rb.reward_std), step)
-
-                if num_episode % args.target_network_update_freq == 0:
-                    soft_update(target_net=target_actor, utility_net=actor, polyak=args.polyak)
-                    soft_update(target_net=target_critic, utility_net=critic, polyak=args.polyak)
+            if step >= args.total_timesteps:
+                break
 
         num_episode += 1
         ep_rewards.extend(ep_reward.tolist())
         ep_lengths.extend(ep_len.tolist())
 
-        # logging
         if num_episode % args.log_every == 0:
             writer.add_scalar("rollout/ep_reward", float(np.mean(ep_rewards)), step)
             writer.add_scalar("rollout/ep_length", float(np.mean(ep_lengths)), step)
@@ -1003,19 +1024,15 @@ if __name__ == "__main__":
                 writer.add_scalar("cluster/num_clusters", float(last_num_clusters), step)
                 writer.add_scalar("cluster/mean_pairwise_policy_dist", float(last_mean_policy_dist), step)
 
-        # -------------------------
-        # Evaluation loop + optional rendering/video
-        # -------------------------
         if step >= next_eval_step:
             video_root = Path(args.eval_video_dir) / run_name / f"step_{step}"
             video_root.mkdir(parents=True, exist_ok=True)
             print(f"[eval] num_episode={num_episode} step={step} saving={args.eval_save_video}")
 
-            eval_obs, _ = eval_env.reset(seed=args.seed + 100000 + num_episode)
+            eval_obs, _ = eval_env.reset()
             eval_ep = 0
             eval_ep_reward, eval_ep_length = [], []
             current_reward, current_ep_length = 0.0, 0
-
             frames = []
 
             while eval_ep < args.num_eval_ep:
@@ -1027,7 +1044,7 @@ if __name__ == "__main__":
                         frames.append(frame)
 
                 with torch.no_grad():
-                    eval_obs_t = torch.from_numpy(eval_obs).float().to(device)  # (1, N, O)
+                    eval_obs_t = torch.from_numpy(eval_obs).float().to(device)
                     eval_actions = action_scale * torch.tanh(actor.act(eval_obs_t)) + action_bias
 
                 next_obs_, reward, done, truncated, _ = eval_env.step(eval_actions.cpu().numpy())
@@ -1045,7 +1062,7 @@ if __name__ == "__main__":
                         _maybe_write_video(frames, out_path, fps=int(args.eval_video_fps), fmt=args.eval_video_format)
 
                     frames = []
-                    eval_obs, _ = eval_env.reset(seed=args.seed + 200000 + eval_ep)
+                    eval_obs, _ = eval_env.reset()
                     eval_ep_reward.append(current_reward)
                     eval_ep_length.append(current_ep_length)
                     current_reward, current_ep_length = 0.0, 0
@@ -1054,12 +1071,16 @@ if __name__ == "__main__":
             writer.add_scalar("eval/ep_reward", float(np.mean(eval_ep_reward)), step)
             writer.add_scalar("eval/std_ep_reward", float(np.std(eval_ep_reward)), step)
             writer.add_scalar("eval/ep_length", float(np.mean(eval_ep_length)), step)
+
             next_eval_step += int(args.eval_steps)
-            
+
+        if step < args.total_timesteps:
+            obs, _ = env.reset()
+
     writer.close()
     if args.use_wnb:
         import wandb
-
         wandb.finish()
+
     env.close()
     eval_env.close()

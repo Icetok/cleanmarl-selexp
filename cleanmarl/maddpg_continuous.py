@@ -799,7 +799,7 @@ if __name__ == "__main__":
             entity=args.wnb_entity,
             sync_tensorboard=True,
             config=vars(args),
-            name=f"MADDPG-continuous-{run_name}",
+            name=f"MADDPG-continuous-{run_name}-seed{args.seed}",
         )
 
     writer = SummaryWriter(f"runs/MADDPG-continuous-{run_name}")
@@ -921,8 +921,6 @@ if __name__ == "__main__":
                                 cluster_alpha[cluster_key] = 0.0
 
                             cluster_score_windows[cluster_key].append(score)
-                            if len(cluster_score_windows[cluster_key]) > args.adv_alpha_window:
-                                cluster_score_windows[cluster_key] = cluster_score_windows[cluster_key][-args.adv_alpha_window :]
 
                             if len(cluster_score_windows[cluster_key]) >= 100:
                                 q = float(
@@ -931,10 +929,7 @@ if __name__ == "__main__":
                                         1.0 - float(args.adv_keep_frac),
                                     )
                                 )
-                                cluster_alpha[cluster_key] = (
-                                    float(args.adv_alpha_ema_beta) * float(cluster_alpha[cluster_key])
-                                    + (1.0 - float(args.adv_alpha_ema_beta)) * q
-                                )
+                                cluster_alpha[cluster_key] = q
 
                         if step < args.adv_warmup_steps:
                             keep_mask[e] = True
@@ -1012,6 +1007,7 @@ if __name__ == "__main__":
             ep_rewards, ep_lengths = [], []
 
         if args.semantic_enabled and num_episode % args.semantic_log_every == 0:
+            writer.add_scalar("semantic/buffer_keep_rate", float(np.mean(rb.keep_mask[:rb.size])) if rb.size > 0 else 1.0, step)
             writer.add_scalar("semantic/step_keep_rate", float(semantic_kept_steps) / max(1, semantic_total_steps), step)
             writer.add_scalar("semantic/adv_keep_frac_target", float(args.adv_keep_frac), step)
 

@@ -57,18 +57,37 @@ class Args:
     vmas_shared_reward: bool = True
     vmas_agent_collision_penalty: float = 0.0
 
+    # -------------------------
+    # VMAS sampling config
+    # -------------------------
+    vmas_sampling_n_gaussians: int = 3
+    vmas_sampling_shared_rew: bool = False
+
+    # -------------------------
+    # VMAS navigation config
+    # -------------------------
+    vmas_navigation_collisions: bool = True
+    vmas_navigation_shared_rew: bool = False
+    vmas_navigation_split_goals: bool = False
+    vmas_navigation_agent_radius: float = 0.1
+    vmas_navigation_observe_all_goals: bool = False
+    vmas_navigation_agents_with_same_goal: int = 1
+
     # PPO / MAPPO hyperparameters
     rollout_steps: int = 100
     ppo_epochs: int = 10
+    ppo_minibatch_size: int = 0  # 0 = full batch
 
     actor_hidden_dim: int = 128
     actor_num_layers: int = 2
     critic_hidden_dim: int = 128
     critic_num_layers: int = 2
+    activation: str = "relu"  # "relu" | "tanh"
 
     optimizer: str = "Adam"
     learning_rate_actor: float = 3e-4
     learning_rate_critic: float = 3e-4
+    adam_eps: float = 1e-5
 
     total_timesteps: int = 150000
     gamma: float = 0.99
@@ -81,7 +100,7 @@ class Args:
     ppo_clip: float = 0.2
     entropy_coef: float = 0.001
     value_coef: float = 0.5
-    clip_gradients: float = 1.0
+    clip_gradients: float = 5.0
 
     log_every: int = 10
     eval_steps: int = 5000
@@ -94,6 +113,8 @@ class Args:
     eval_video_fps: int = 20
     eval_video_format: str = "mp4"
     eval_video_max_frames: int = 2000
+    eval_num_videos_to_save: int = 3
+    eval_num_envs: int = 1
 
     # W&B / device / seed
     use_wnb: bool = False
@@ -126,6 +147,15 @@ class Args:
     cluster_proximity_radius: float = 0.75
     cluster_policy_dist_thresh: float = 0.25
     cluster_keep_rule: str = "any"
+
+
+def _make_activation(name: str) -> nn.Module:
+    name = name.lower().strip()
+    if name == "relu":
+        return nn.ReLU()
+    if name == "tanh":
+        return nn.Tanh()
+    raise ValueError(f"Unsupported activation: {name}")
 
 
 class RunningRewardStats:
@@ -236,11 +266,11 @@ class RolloutBuffer:
 
 
 class Actor(nn.Module):
-    def __init__(self, input_dim, hidden_dim, num_layer, output_dim) -> None:
+    def __init__(self, input_dim, hidden_dim, num_layer, output_dim, activation_name="relu") -> None:
         super().__init__()
-        mean_layers = [nn.Sequential(nn.Linear(input_dim, hidden_dim), nn.ReLU())]
+        mean_layers = [nn.Sequential(nn.Linear(input_dim, hidden_dim), _make_activation(activation_name))]
         for _ in range(num_layer):
-            mean_layers.append(nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.ReLU()))
+            mean_layers.append(nn.Sequential(nn.Linear(hidden_dim, hidden_dim), _make_activation(activation_name)))
         mean_layers.append(nn.Sequential(nn.Linear(hidden_dim, output_dim)))
         self.mean_layers = nn.ModuleList(mean_layers)
 
@@ -275,12 +305,12 @@ class Actor(nn.Module):
 
 
 class Critic(nn.Module):
-    def __init__(self, input_dim, hidden_dim, num_layer) -> None:
+    def __init__(self, input_dim, hidden_dim, num_layer, activation_name="relu") -> None:
         super().__init__()
         self.layers = nn.ModuleList()
-        self.layers.append(nn.Sequential(nn.Linear(input_dim, hidden_dim), nn.ReLU()))
+        self.layers.append(nn.Sequential(nn.Linear(input_dim, hidden_dim), _make_activation(activation_name)))
         for _ in range(num_layer):
-            self.layers.append(nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.ReLU()))
+            self.layers.append(nn.Sequential(nn.Linear(hidden_dim, hidden_dim), _make_activation(activation_name)))
         self.layers.append(nn.Sequential(nn.Linear(hidden_dim, 1)))
 
     def forward(self, x):
@@ -462,6 +492,28 @@ def _build_vmas_kwargs(args: Args, num_envs: int) -> dict:
             }
         )
 
+    elif args.env_name == "sampling":
+        kwargs.update(
+            {
+                "lidar_range": float(args.vmas_lidar_range),
+                "n_gaussians": int(args.vmas_sampling_n_gaussians),
+                "shared_rew": bool(args.vmas_sampling_shared_rew),
+            }
+        )
+
+    elif args.env_name == "navigation":
+        kwargs.update(
+            {
+                "collisions": bool(args.vmas_navigation_collisions),
+                "shared_rew": bool(args.vmas_navigation_shared_rew),
+                "lidar_range": float(args.vmas_lidar_range),
+                "split_goals": bool(args.vmas_navigation_split_goals),
+                "agent_radius": float(args.vmas_navigation_agent_radius),
+                "observe_all_goals": bool(args.vmas_navigation_observe_all_goals),
+                "agents_with_same_goal": int(args.vmas_navigation_agents_with_same_goal),
+            }
+        )
+
     return kwargs
 
 
@@ -511,7 +563,7 @@ if __name__ == "__main__":
     device = torch.device(args.device)
 
     kwargs = _build_vmas_kwargs(args, num_envs=args.vmas_num_envs)
-    eval_kwargs = _build_vmas_kwargs(args, num_envs=1)
+    eval_kwargs = _build_vmas_kwargs(args, num_envs=args.eval_num_envs)
 
     env = environment(args.env_type, args.env_name, args.env_family, args.agent_ids, kwargs)
     eval_env = environment(args.env_type, args.env_name, args.env_family, args.agent_ids, eval_kwargs)
@@ -553,17 +605,19 @@ if __name__ == "__main__":
         hidden_dim=args.actor_hidden_dim,
         num_layer=args.actor_num_layers,
         output_dim=env.get_action_size(),
+        activation_name=args.activation,
     ).to(device)
 
     critic = Critic(
         input_dim=env.get_state_size(),
         hidden_dim=args.critic_hidden_dim,
         num_layer=args.critic_num_layers,
+        activation_name=args.activation,
     ).to(device)
 
     Optimizer = getattr(optim, args.optimizer)
-    actor_optimizer = Optimizer(actor.parameters(), lr=args.learning_rate_actor, eps=1e-5)
-    critic_optimizer = Optimizer(critic.parameters(), lr=args.learning_rate_critic, eps=1e-5)
+    actor_optimizer = Optimizer(actor.parameters(), lr=args.learning_rate_actor, eps=args.adam_eps)
+    critic_optimizer = Optimizer(critic.parameters(), lr=args.learning_rate_critic, eps=args.adam_eps)
 
     time_token = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     run_name = f"{args.env_type}__{args.env_name}__{time_token}"
@@ -598,12 +652,14 @@ if __name__ == "__main__":
 
     reward_stats = RunningRewardStats()
 
-    # To match MADDPG semantics as closely as possible:
-    # keep full-history cluster-score records (no alpha window truncation)
     cluster_score_windows: dict[tuple, list[float]] = {}
     cluster_alpha: dict[tuple, float] = {}
 
-    ep_rewards, ep_lengths = [], []
+    completed_ep_returns_raw_team = []
+    completed_ep_lengths = []
+    current_ep_reward = np.zeros((env.num_envs,), dtype=np.float32)
+    current_ep_length = np.zeros((env.num_envs,), dtype=np.int32)
+
     num_episode, training_step, step = 0, 0, 0
 
     semantic_total_steps = 0
@@ -624,6 +680,7 @@ if __name__ == "__main__":
         last_cluster_entropy = 0.0
         last_num_clusters = 1.0
         last_mean_policy_dist = 0.0
+        reward_batch_std_used = None
 
         # -------------------------
         # Collect rollout
@@ -652,8 +709,6 @@ if __name__ == "__main__":
 
             reward_stats.update(reward_np)
 
-            # For wrapper semantic modes, store directly now.
-            # For advantage mode, overwrite after GAE computation.
             step_keep_mask_t = None
             step_semantic_score_t = None
             if args.semantic_enabled and args.semantic_mode != "advantage":
@@ -694,15 +749,19 @@ if __name__ == "__main__":
                     last_num_clusters = float(len(clusters))
                     last_mean_policy_dist = float(cstats["mean_pairwise_policy_dist"])
 
-            ep_rewards.extend(reward_np.tolist())
+            current_ep_reward += reward_np
+            current_ep_length += 1
             step += env.num_envs
 
             ended = np.where(terminal_np > 0.5)[0]
             if len(ended) > 0:
-                ep_lengths.extend([1] * len(ended))
+                completed_ep_returns_raw_team.extend(current_ep_reward[ended].tolist())
+                completed_ep_lengths.extend(current_ep_length[ended].tolist())
                 num_episode += len(ended)
 
                 obs, _ = env.reset(seed=args.seed + training_step + int(step))
+                current_ep_reward[:] = 0.0
+                current_ep_length[:] = 0
             else:
                 obs = next_obs
 
@@ -722,8 +781,8 @@ if __name__ == "__main__":
         values = rb.values[:rb.ptr]
 
         if args.normalize_reward:
-            rew_std = torch.clamp(rewards.std(), min=1e-6)
-            rewards = rewards / rew_std
+            reward_batch_std_used = torch.clamp(rewards.std(), min=1e-6)
+            rewards = rewards / reward_batch_std_used
 
         advantages = torch.zeros_like(rewards, device=device)
         returns = torch.zeros_like(rewards, device=device)
@@ -775,9 +834,6 @@ if __name__ == "__main__":
                         clusters = [list(range(env.n_agents))]
                         cstats = {"mean_pairwise_policy_dist": 0.0, "num_clusters": 1.0}
 
-                    # MAPPO has env-step scalar GAE advantage, not per-agent Q-advantage.
-                    # To keep feature parity with MADDPG's selection interface, use
-                    # |advantage| as the score and propagate it over agents for clustering.
                     abs_adv_scalar = float(torch.abs(advantages[t, e]).detach().cpu().item())
                     agent_scores = np.full((env.n_agents,), abs_adv_scalar, dtype=np.float32)
 
@@ -850,85 +906,128 @@ if __name__ == "__main__":
         critic_gradients = []
         clipped_ratios = []
 
+        total_step_samples = T * E
+        step_minibatch_size = total_step_samples if args.ppo_minibatch_size <= 0 else min(args.ppo_minibatch_size, total_step_samples)
+        agent_offsets = torch.arange(N, device=device).unsqueeze(0)
+
         for _ in range(args.ppo_epochs):
-            _, current_logprob, current_entropy = actor.act(
-                x=b_obs,
-                action_scale=action_scale,
-                action_bias=action_bias,
-                actions=b_actions,
-            )
+            step_perm = torch.randperm(total_step_samples, device=device)
 
-            log_ratio = current_logprob - b_old_log_probs
-            ratio = torch.exp(log_ratio)
+            for start in range(0, total_step_samples, step_minibatch_size):
+                idx_step = step_perm[start : start + step_minibatch_size]
+                idx_agent = (idx_step.unsqueeze(1) * N + agent_offsets).reshape(-1)
 
-            pg_loss1 = b_advantages * ratio
-            pg_loss2 = b_advantages * torch.clamp(ratio, 1 - args.ppo_clip, 1 + args.ppo_clip)
+                mb_obs = b_obs[idx_agent]
+                mb_actions = b_actions[idx_agent]
+                mb_old_log_probs = b_old_log_probs[idx_agent]
+                mb_advantages = b_advantages[idx_agent]
 
-            if args.semantic_enabled:
-                actor_loss = -torch.min(pg_loss1[b_keep_agent], pg_loss2[b_keep_agent]).mean()
-                entropy_bonus = current_entropy[b_keep_agent].mean()
-            else:
-                actor_loss = -torch.min(pg_loss1, pg_loss2).mean()
-                entropy_bonus = current_entropy.mean()
+                mb_states = b_states[idx_step]
+                mb_returns = b_returns[idx_step]
 
-            total_actor_loss = actor_loss - args.entropy_coef * entropy_bonus
+                mb_keep_step = b_keep_step[idx_step]
+                mb_keep_agent = b_keep_agent[idx_agent]
 
-            current_values = critic(b_states)
-            if args.semantic_enabled:
-                critic_loss = F.mse_loss(current_values[b_keep_step], b_returns[b_keep_step])
-            else:
-                critic_loss = F.mse_loss(current_values, b_returns)
+                if mb_keep_step.sum().item() == 0:
+                    mb_keep_step = torch.ones_like(mb_keep_step, dtype=torch.bool, device=device)
+                if mb_keep_agent.sum().item() == 0:
+                    mb_keep_agent = torch.ones_like(mb_keep_agent, dtype=torch.bool, device=device)
 
-            total_loss = total_actor_loss + args.value_coef * critic_loss
+                _, current_logprob, current_entropy = actor.act(
+                    x=mb_obs,
+                    action_scale=action_scale,
+                    action_bias=action_bias,
+                    actions=mb_actions,
+                )
 
-            actor_optimizer.zero_grad()
-            critic_optimizer.zero_grad()
-            total_loss.backward()
+                log_ratio = current_logprob - mb_old_log_probs
+                ratio = torch.exp(log_ratio)
 
-            actor_gradient = norm_d([p.grad for p in actor.parameters()], 2)
-            critic_gradient = norm_d([p.grad for p in critic.parameters()], 2)
+                pg_loss1 = mb_advantages * ratio
+                pg_loss2 = mb_advantages * torch.clamp(ratio, 1 - args.ppo_clip, 1 + args.ppo_clip)
 
-            if args.clip_gradients > 0:
-                torch.nn.utils.clip_grad_norm_(actor.parameters(), max_norm=args.clip_gradients)
-                torch.nn.utils.clip_grad_norm_(critic.parameters(), max_norm=args.clip_gradients)
+                if args.semantic_enabled:
+                    actor_loss = -torch.min(pg_loss1[mb_keep_agent], pg_loss2[mb_keep_agent]).mean()
+                    entropy_bonus = current_entropy[mb_keep_agent].mean()
+                else:
+                    actor_loss = -torch.min(pg_loss1, pg_loss2).mean()
+                    entropy_bonus = current_entropy.mean()
 
-            actor_optimizer.step()
-            critic_optimizer.step()
+                total_actor_loss = actor_loss - args.entropy_coef * entropy_bonus
 
-            if args.semantic_enabled:
-                approx_kl = ((ratio[b_keep_agent] - 1) - log_ratio[b_keep_agent]).mean()
-                clipped_ratio = ((ratio[b_keep_agent] - 1.0).abs() > args.ppo_clip).float().mean()
-            else:
-                approx_kl = ((ratio - 1) - log_ratio).mean()
-                clipped_ratio = ((ratio - 1.0).abs() > args.ppo_clip).float().mean()
+                current_values = critic(mb_states)
+                if args.semantic_enabled:
+                    critic_loss = F.mse_loss(current_values[mb_keep_step], mb_returns[mb_keep_step])
+                else:
+                    critic_loss = F.mse_loss(current_values, mb_returns)
 
-            training_step += 1
+                total_loss = total_actor_loss + args.value_coef * critic_loss
 
-            actor_losses.append(float(actor_loss.detach().cpu().item()))
-            critic_losses.append(float(critic_loss.detach().cpu().item()))
-            entropies_bonuses.append(float(entropy_bonus.detach().cpu().item()))
-            kl_divergences.append(float(approx_kl.detach().cpu().item()))
-            actor_gradients.append(float(actor_gradient.detach().cpu().item()))
-            critic_gradients.append(float(critic_gradient.detach().cpu().item()))
-            clipped_ratios.append(float(clipped_ratio.detach().cpu().item()))
+                actor_optimizer.zero_grad()
+                critic_optimizer.zero_grad()
+                total_loss.backward()
+
+                actor_gradient = norm_d([p.grad for p in actor.parameters()], 2)
+                critic_gradient = norm_d([p.grad for p in critic.parameters()], 2)
+
+                if args.clip_gradients > 0:
+                    torch.nn.utils.clip_grad_norm_(actor.parameters(), max_norm=args.clip_gradients)
+                    torch.nn.utils.clip_grad_norm_(critic.parameters(), max_norm=args.clip_gradients)
+
+                actor_optimizer.step()
+                critic_optimizer.step()
+
+                if args.semantic_enabled:
+                    approx_kl = ((ratio[mb_keep_agent] - 1) - log_ratio[mb_keep_agent]).mean()
+                    clipped_ratio = ((ratio[mb_keep_agent] - 1.0).abs() > args.ppo_clip).float().mean()
+                else:
+                    approx_kl = ((ratio - 1) - log_ratio).mean()
+                    clipped_ratio = ((ratio - 1.0).abs() > args.ppo_clip).float().mean()
+
+                training_step += 1
+
+                actor_losses.append(float(actor_loss.detach().cpu().item()))
+                critic_losses.append(float(critic_loss.detach().cpu().item()))
+                entropies_bonuses.append(float(entropy_bonus.detach().cpu().item()))
+                kl_divergences.append(float(approx_kl.detach().cpu().item()))
+                actor_gradients.append(float(actor_gradient.detach().cpu().item()))
+                critic_gradients.append(float(critic_gradient.detach().cpu().item()))
+                clipped_ratios.append(float(clipped_ratio.detach().cpu().item()))
 
         writer.add_scalar("train/critic_loss", np.mean(critic_losses), step)
         writer.add_scalar("train/actor_loss", np.mean(actor_losses), step)
-        writer.add_scalar("train/entropy", np.mean(entropies_bonuses), step)
-        writer.add_scalar("train/kl_divergence", np.mean(kl_divergences), step)
-        writer.add_scalar("train/clipped_ratios", np.mean(clipped_ratios), step)
-        writer.add_scalar("train/actor_gradients", np.mean(actor_gradients), step)
-        writer.add_scalar("train/critic_gradients", np.mean(critic_gradients), step)
-        writer.add_scalar("train/num_updates", training_step, step)
-        writer.add_scalar("train/reward_std_running", float(reward_stats.reward_std), step)
+        writer.add_scalar("train/policy_entropy", np.mean(entropies_bonuses), step)
+        writer.add_scalar("train/approx_kl", np.mean(kl_divergences), step)
+        writer.add_scalar("train/clipped_ratio_fraction", np.mean(clipped_ratios), step)
+        writer.add_scalar("train/actor_grad_norm", np.mean(actor_gradients), step)
+        writer.add_scalar("train/critic_grad_norm", np.mean(critic_gradients), step)
+        writer.add_scalar("train/num_updates_total", training_step, step)
+        writer.add_scalar("train/reward_raw_team_running_std", float(reward_stats.reward_std), step)
 
-        if num_episode % args.log_every == 0 and len(ep_rewards) > 0:
-            writer.add_scalar("rollout/ep_reward", float(np.mean(ep_rewards)), step)
-            writer.add_scalar("rollout/ep_length", float(np.mean(ep_lengths)) if len(ep_lengths) > 0 else 0.0, step)
-            writer.add_scalar("rollout/num_episodes", num_episode, step)
-            writer.add_scalar("rollout/reward_mean_running", float(reward_stats.reward_mean), step)
-            writer.add_scalar("rollout/reward_std_running", float(reward_stats.reward_std), step)
-            ep_rewards, ep_lengths = [], []
+        if reward_batch_std_used is not None:
+            writer.add_scalar(
+                "train/reward_batch_std_used_for_normalization",
+                float(reward_batch_std_used.item()),
+                step,
+            )
+
+        if num_episode % args.log_every == 0 and len(completed_ep_returns_raw_team) > 0:
+            writer.add_scalar(
+                "rollout/completed_ep_return_raw_team_mean",
+                float(np.mean(completed_ep_returns_raw_team)),
+                step,
+            )
+            writer.add_scalar(
+                "rollout/completed_ep_length_mean",
+                float(np.mean(completed_ep_lengths)) if len(completed_ep_lengths) > 0 else 0.0,
+                step,
+            )
+            writer.add_scalar("rollout/completed_episodes_total", num_episode, step)
+            writer.add_scalar("rollout/step_reward_raw_team_running_mean", float(reward_stats.reward_mean), step)
+            writer.add_scalar("rollout/step_reward_raw_team_running_std", float(reward_stats.reward_std), step)
+
+            completed_ep_returns_raw_team = []
+            completed_ep_lengths = []
 
         if args.semantic_enabled and num_episode % args.semantic_log_every == 0:
             writer.add_scalar(
@@ -955,16 +1054,27 @@ if __name__ == "__main__":
         if step >= next_eval_step:
             video_root = Path(args.eval_video_dir) / run_name / f"step_{step}"
             video_root.mkdir(parents=True, exist_ok=True)
-            print(f"[eval] step={step} saving={args.eval_save_video}")
+            print(
+                f"[eval] step={step} saving={args.eval_save_video} "
+                f"eval_num_envs={args.eval_num_envs} num_eval_ep={args.num_eval_ep}"
+            )
 
             eval_obs, _ = eval_env.reset()
-            eval_ep = 0
-            eval_ep_reward, eval_ep_length = [], []
-            current_reward, current_ep_length = 0.0, 0
-            frames = []
 
-            while eval_ep < args.num_eval_ep:
-                if args.eval_render or args.eval_save_video:
+            eval_envs = int(np.asarray(eval_obs).shape[0])
+            eval_completed = 0
+
+            eval_ep_reward = []
+            eval_ep_length = []
+
+            eval_current_reward = np.zeros((eval_envs,), dtype=np.float32)
+            eval_current_ep_length = np.zeros((eval_envs,), dtype=np.int32)
+
+            frames = []
+            save_video_this_eval = bool(args.eval_save_video) and eval_envs == 1
+
+            while eval_completed < args.num_eval_ep:
+                if (args.eval_render or save_video_this_eval) and eval_envs == 1:
                     frame = None
                     if hasattr(eval_env, "render"):
                         frame = eval_env.render(mode="rgb_array")
@@ -980,29 +1090,61 @@ if __name__ == "__main__":
                     )
 
                 next_obs_, reward, done, truncated, _ = eval_env.step(eval_actions.cpu().numpy())
-                reward_scalar = float(np.asarray(reward).reshape(-1)[0])
-                done_scalar = bool(np.asarray(done).reshape(-1)[0])
-                truncated_scalar = bool(np.asarray(truncated).reshape(-1)[0])
 
-                current_reward += reward_scalar
-                current_ep_length += 1
-                eval_obs = next_obs_
+                next_obs_np = np.asarray(next_obs_)
+                reward_np = np.asarray(reward, dtype=np.float32).reshape(-1)
+                done_np = np.asarray(done, dtype=bool).reshape(-1)
+                truncated_np = np.asarray(truncated, dtype=bool).reshape(-1)
 
-                if done_scalar or truncated_scalar:
-                    if args.eval_save_video:
-                        out_path = video_root / f"eval_ep_{eval_ep}"
-                        _maybe_write_video(frames, out_path, fps=int(args.eval_video_fps), fmt=args.eval_video_format)
+                active_envs = min(
+                    len(eval_current_reward),
+                    len(reward_np),
+                    len(done_np),
+                    len(truncated_np),
+                    int(next_obs_np.shape[0]),
+                )
 
-                    frames = []
-                    eval_obs, _ = eval_env.reset()
-                    eval_ep_reward.append(current_reward)
-                    eval_ep_length.append(current_ep_length)
-                    current_reward, current_ep_length = 0.0, 0
-                    eval_ep += 1
+                reward_np = reward_np[:active_envs]
+                done_np = done_np[:active_envs]
+                truncated_np = truncated_np[:active_envs]
+                next_obs_np = next_obs_np[:active_envs]
 
-            writer.add_scalar("eval/ep_reward", float(np.mean(eval_ep_reward)), step)
-            writer.add_scalar("eval/std_ep_reward", float(np.std(eval_ep_reward)), step)
-            writer.add_scalar("eval/ep_length", float(np.mean(eval_ep_length)), step)
+                terminal_np = np.logical_or(done_np, truncated_np)
+
+                eval_current_reward[:active_envs] += reward_np
+                eval_current_ep_length[:active_envs] += 1
+                eval_obs = next_obs_np
+
+                ended = np.where(terminal_np)[0]
+                if len(ended) > 0:
+                    remaining = args.num_eval_ep - eval_completed
+                    to_take = ended[:remaining]
+
+                    eval_ep_reward.extend(eval_current_reward[to_take].tolist())
+                    eval_ep_length.extend(eval_current_ep_length[to_take].tolist())
+
+                    if save_video_this_eval and eval_completed < int(args.eval_num_videos_to_save):
+                        out_path = video_root / f"eval_ep_{eval_completed}"
+                        _maybe_write_video(
+                            frames,
+                            out_path,
+                            fps=int(args.eval_video_fps),
+                            fmt=args.eval_video_format,
+                        )
+
+                    eval_current_reward[ended] = 0.0
+                    eval_current_ep_length[ended] = 0
+                    eval_completed += len(to_take)
+
+                    if save_video_this_eval:
+                        frames = []
+
+                if eval_completed >= args.num_eval_ep:
+                    break
+
+            writer.add_scalar("eval/ep_return_raw_team_mean", float(np.mean(eval_ep_reward)), step)
+            writer.add_scalar("eval/ep_return_raw_team_std", float(np.std(eval_ep_reward)), step)
+            writer.add_scalar("eval/ep_length_mean", float(np.mean(eval_ep_length)), step)
 
             next_eval_step += int(args.eval_steps)
 

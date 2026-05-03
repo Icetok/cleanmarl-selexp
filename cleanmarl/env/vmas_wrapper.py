@@ -5,7 +5,7 @@ import vmas
 
 class VMASWrapper:
     """
-    Wraps a VMAS environment to match the interface expected by the MADDPG script.
+    Wraps a VMAS environment to match the interface expected by the training scripts.
 
     Supports:
       - parallel VMAS collection via num_envs
@@ -13,12 +13,13 @@ class VMASWrapper:
       - critic state from RAW obs only
       - team reward aggregation
       - best-effort rgb rendering for num_envs=1
+      - per-env reset_at support for vectorised envs
     """
 
     def __init__(
         self,
         scenario="balance",
-        n_agents=4,
+        n_agents=4,  # kept for interface compatibility; VMAS determines actual n_agents from obs
         max_steps=100,
         num_envs=1,
         agent_ids=True,
@@ -56,12 +57,12 @@ class VMASWrapper:
             **kwargs,
         )
 
-        self.t = 0
+        self.t = np.zeros((self.num_envs,), dtype=np.int32)
 
         obs = self.env.reset()
         if isinstance(obs, tuple):
             obs = obs[0]
-        obs_raw = self._to_np_obs(obs)  # (E, N, obs_dim)
+        obs_raw = self._to_np_obs(obs)
 
         self.n_agents = int(obs_raw.shape[1])
         self._base_obs_size = int(obs_raw.shape[-1])
@@ -77,7 +78,6 @@ class VMASWrapper:
             obs0 = self._append_agent_ids(obs0)
         self._last_obs = obs0
 
-        # action bounds (fallback-safe)
         if hasattr(act_space0, "low") and hasattr(act_space0, "high"):
             self.act_low = np.asarray(act_space0.low, dtype=np.float32)
             self.act_high = np.asarray(act_space0.high, dtype=np.float32)
@@ -92,14 +92,14 @@ class VMASWrapper:
         return self._act_size
 
     def get_state_size(self):
-        # critic sees RAW obs only
         return self.n_agents * self._base_obs_size
 
     def get_last_semantic(self):
         return self._last_semantic_score, self._last_semantic_keep
 
     def reset(self, seed=None):
-        self.t = 0
+        self.t = np.zeros((self.num_envs,), dtype=np.int32)
+
         try:
             obs = self.env.reset(seed=seed) if seed is not None else self.env.reset()
         except TypeError:
@@ -121,6 +121,7 @@ class VMASWrapper:
         self._last_obs = obs_out
         self._last_semantic_score = np.zeros((self.num_envs,), dtype=np.float32)
         self._last_semantic_keep = np.ones((self.num_envs,), dtype=bool)
+
         return obs_out, {}
 
     def step(self, actions):
@@ -129,11 +130,12 @@ class VMASWrapper:
         obs, rew, done, info = self.env.step(self._format_actions(actions))
 
         obs_raw = self._to_np_obs(obs)
+
         self.n_agents = int(obs_raw.shape[1])
         self._obs_size = self._base_obs_size + (self.n_agents if self.agent_ids else 0)
 
-        r_vec = self._to_np_rew(rew)  # (E, N) or compatible
-        reward_team = self._aggregate_reward(r_vec)  # (E,)
+        r_vec = self._to_np_rew(rew)
+        reward_team = self._aggregate_reward(r_vec)
 
         if self.semantic_enabled:
             s_score = self._compute_semantic_score(obs_raw=obs_raw, reward_scalar=reward_team)
@@ -156,7 +158,7 @@ class VMASWrapper:
 
         truncated = np.zeros((self.num_envs,), dtype=bool)
         if self.max_steps is not None:
-            truncated[:] = self.t >= self.max_steps
+            truncated = self.t >= self.max_steps
 
         infos = self._to_info_dict(info)
         infos["semantic_score"] = self._last_semantic_score
@@ -168,27 +170,84 @@ class VMASWrapper:
 
         return obs_out, reward_team.astype(np.float32), terminated, truncated, infos
 
+    def reset_at(self, indices=None):
+        if indices is None:
+            return self.reset()
+
+        indices = np.asarray(indices, dtype=np.int32).reshape(-1)
+
+        if len(indices) == 0:
+            return self._last_obs.copy(), {}
+
+        for idx in indices:
+            idx = int(idx)
+
+            try:
+                obs_idx = self.env.reset_at(idx)
+            except AttributeError:
+                obs_idx = self.env.reset()
+
+            if isinstance(obs_idx, tuple):
+                obs_idx = obs_idx[0]
+
+            if isinstance(obs_idx, list):
+                obs_idx = torch.stack(obs_idx, dim=0)
+
+            if isinstance(obs_idx, torch.Tensor):
+                obs_idx = obs_idx.detach().cpu().numpy()
+
+            obs_idx = np.asarray(obs_idx)
+
+            if obs_idx.ndim == 2 and obs_idx.shape[0] == self.n_agents:
+                self._last_obs_raw[idx] = obs_idx.astype(np.float32, copy=False)
+            elif obs_idx.ndim == 3 and obs_idx.shape[0] == 1 and obs_idx.shape[1] == self.n_agents:
+                self._last_obs_raw[idx] = obs_idx[0].astype(np.float32, copy=False)
+            elif obs_idx.ndim == 3 and obs_idx.shape[0] == self.num_envs and obs_idx.shape[1] == self.n_agents:
+                self._last_obs_raw[idx] = obs_idx[idx].astype(np.float32, copy=False)
+            else:
+                obs_idx_raw = self._to_np_obs(obs_idx)
+                if obs_idx_raw.shape[0] == 1:
+                    self._last_obs_raw[idx] = obs_idx_raw[0]
+                elif obs_idx_raw.shape[0] == self.num_envs:
+                    self._last_obs_raw[idx] = obs_idx_raw[idx]
+
+            self.t[idx] = 0
+            self._last_semantic_score[idx] = 0.0
+            self._last_semantic_keep[idx] = True
+
+        obs_out = self._last_obs_raw
+        if self.agent_ids:
+            obs_out = self._append_agent_ids(obs_out)
+
+        self._last_obs = obs_out
+        return obs_out.copy(), {}
+
     def get_state(self):
-        # (E, state_dim)
         return self._last_obs_raw.reshape(self.num_envs, -1)
 
     def get_avail_actions(self):
         return np.ones((self.num_envs, self.n_agents, self.get_action_size()), dtype=bool)
 
     def render(self, mode="rgb_array"):
-        """
-        Best effort. Rendering is only meaningful for num_envs=1.
-        """
         if self.num_envs != 1:
             return None
 
         try:
             frame = self.env.render(mode=mode)
+
             if isinstance(frame, torch.Tensor):
                 frame = frame.detach().cpu().numpy()
+
+            if isinstance(frame, list) and len(frame) > 0:
+                frame = frame[0]
+            elif isinstance(frame, tuple) and len(frame) > 0:
+                frame = frame[0]
+
             return frame
+
         except TypeError:
             pass
+
         except Exception as e:
             if not hasattr(self, "_render_warned"):
                 self._render_warned = True
@@ -197,9 +256,17 @@ class VMASWrapper:
 
         try:
             frame = self.env.render()
+
             if isinstance(frame, torch.Tensor):
                 frame = frame.detach().cpu().numpy()
+
+            if isinstance(frame, list) and len(frame) > 0:
+                frame = frame[0]
+            elif isinstance(frame, tuple) and len(frame) > 0:
+                frame = frame[0]
+
             return frame
+
         except Exception:
             return None
 
@@ -210,17 +277,14 @@ class VMASWrapper:
             except TypeError:
                 pass
 
-    # -----------------------
-    # Wrapper semantic computation
-    # -----------------------
     def _compute_semantic_score(self, obs_raw: np.ndarray, reward_scalar) -> np.ndarray:
-        # obs_raw: (E, N, obs_dim)
         if not self.semantic_enabled:
             return np.zeros((self.num_envs,), dtype=np.float32)
 
         mode = (self.semantic_mode or "interaction").lower().strip()
 
         reward_scalar = np.asarray(reward_scalar, dtype=np.float32).reshape(-1)
+
         if mode == "reward":
             return np.abs(reward_scalar)
 
@@ -228,6 +292,7 @@ class VMASWrapper:
             return np.abs(reward_scalar)
 
         scores = np.zeros((obs_raw.shape[0],), dtype=np.float32)
+
         for e in range(obs_raw.shape[0]):
             pos = obs_raw[e, :, :2].astype(np.float32, copy=False)
 
@@ -252,13 +317,7 @@ class VMASWrapper:
 
         return scores
 
-    # -----------------------
-    # Reward aggregation
-    # -----------------------
     def _aggregate_reward(self, r_vec):
-        """
-        Convert VMAS reward output into per-env team reward of shape (E,).
-        """
         r_np = np.asarray(r_vec, dtype=np.float32)
         r_np = np.squeeze(r_np)
 
@@ -268,33 +327,27 @@ class VMASWrapper:
         if r_np.ndim == 1:
             if r_np.shape[0] == self.num_envs:
                 return r_np.astype(np.float32)
+
             if r_np.shape[0] == self.n_agents and self.num_envs == 1:
                 return np.array([float(np.sum(r_np))], dtype=np.float32)
+
             return np.full((self.num_envs,), float(np.sum(r_np)), dtype=np.float32)
 
-        # common case after conversion: (E, N)
         if r_np.ndim == 2:
             if r_np.shape[0] == self.num_envs and r_np.shape[1] == self.n_agents:
                 return np.sum(r_np, axis=1).astype(np.float32)
+
             if r_np.shape[1] == self.num_envs and r_np.shape[0] == self.n_agents:
                 return np.sum(r_np, axis=0).astype(np.float32)
 
-        # fallback: sum everything per env if possible
         try:
             return np.sum(r_np, axis=tuple(range(1, r_np.ndim))).astype(np.float32)
         except Exception:
             return np.full((self.num_envs,), float(np.sum(r_np)), dtype=np.float32)
 
-    # -----------------------
-    # Conversions / helpers
-    # -----------------------
     def _to_np_obs(self, obs):
-        """
-        Return obs as numpy array of shape (E, N, obs_dim).
-        """
         if isinstance(obs, list):
-            # list length N, each tensor shape (E, obs_dim)
-            obs = torch.stack(obs, dim=0)  # (N, E, obs_dim)
+            obs = torch.stack(obs, dim=0)
 
         if isinstance(obs, torch.Tensor):
             obs = obs.detach()
@@ -304,7 +357,6 @@ class VMASWrapper:
         obs = np.asarray(obs)
 
         if obs.ndim == 3:
-            # normalize to (E, N, obs_dim)
             if obs.shape[0] == self.n_agents if hasattr(self, "n_agents") else False:
                 obs = np.transpose(obs, (1, 0, 2))
             elif obs.shape[1] == self.num_envs:
@@ -312,12 +364,12 @@ class VMASWrapper:
             elif obs.shape[0] == self.num_envs:
                 pass
             else:
-                # try common (N, E, D) fallback
                 if obs.shape[0] < obs.shape[1]:
                     obs = np.transpose(obs, (1, 0, 2))
+
         elif obs.ndim == 2:
-            # num_envs=1 case: (N, D) -> (1, N, D)
             obs = obs[None, :, :]
+
         else:
             raise ValueError(f"Unexpected VMAS obs shape after conversion: {obs.shape}")
 
@@ -337,6 +389,7 @@ class VMASWrapper:
 
         rew = np.asarray(rew)
         rew = np.squeeze(rew)
+
         return rew
 
     def _to_done_np(self, done):
@@ -357,46 +410,43 @@ class VMASWrapper:
         if done.ndim == 1:
             if done.shape[0] == self.num_envs:
                 return done.astype(bool)
+
             if done.shape[0] == self.n_agents and self.num_envs == 1:
                 return np.array([bool(np.any(done))], dtype=bool)
 
         if done.ndim == 2:
             if done.shape[0] == self.num_envs:
                 return np.any(done, axis=1).astype(bool)
+
             if done.shape[1] == self.num_envs:
                 return np.any(done, axis=0).astype(bool)
 
         return np.full((self.num_envs,), bool(np.any(done)), dtype=bool)
 
     def _append_agent_ids(self, obs):
-        # obs: (E, N, D)
         e, n, _ = obs.shape
         ids = np.eye(n, dtype=np.float32)[None, :, :]
         ids = np.repeat(ids, e, axis=0)
+
         return np.concatenate([obs, ids], axis=-1)
 
     def _format_actions(self, actions):
-        """
-        Input:
-          - continuous actions shaped (E, N, A) or (N, A) for E=1
-        Output:
-          - list length N of tensors shaped (E, A)
-        """
         a = np.asarray(actions)
 
         if a.ndim == 2:
-            a = a[None, :, :]  # (1, N, A)
+            a = a[None, :, :]
 
         if a.ndim != 3:
             raise ValueError(f"Unexpected action shape for VMAS continuous actions: {a.shape}")
 
-        # a: (E, N, A) -> list of N tensors (E, A)
         a_t = torch.as_tensor(a, device=self.device, dtype=torch.float32)
+
         return [a_t[:, i, :] for i in range(self.n_agents)]
 
     def _to_info_dict(self, info):
         if isinstance(info, dict):
             out = {}
+
             for k, v in info.items():
                 if isinstance(v, torch.Tensor):
                     vv = v.detach()
@@ -405,5 +455,7 @@ class VMASWrapper:
                     out[k] = vv.numpy()
                 else:
                     out[k] = v
+
             return out
+
         return {}

@@ -31,12 +31,12 @@ print("[boot] mappo_continuous.py imported")
 class Args:
     # Environment selection
     env_type: str = "vmas"
-    env_name: str = "balance"
+    env_name: str = "sampling"
     env_family: str = "vmas"
     agent_ids: bool = True
 
     # VMAS parallel rollout
-    vmas_num_envs: int = 32
+    vmas_num_envs: int = 100
 
     # -------------------------
     # VMAS balance config
@@ -62,6 +62,9 @@ class Args:
     # -------------------------
     vmas_sampling_n_gaussians: int = 3
     vmas_sampling_shared_rew: bool = False
+    vmas_sampling_cov: float = 0.05
+    vmas_sampling_collisions: bool = True
+    vmas_sampling_spawn_same_pos: bool = False
 
     # -------------------------
     # VMAS navigation config
@@ -78,19 +81,19 @@ class Args:
     ppo_epochs: int = 10
     ppo_minibatch_size: int = 0  # 0 = full batch
 
-    actor_hidden_dim: int = 128
-    actor_num_layers: int = 2
-    critic_hidden_dim: int = 128
-    critic_num_layers: int = 2
-    activation: str = "relu"  # "relu" | "tanh"
+    actor_hidden_dim: int = 256
+    actor_num_layers: int = 1
+    critic_hidden_dim: int = 256
+    critic_num_layers: int = 1
+    activation: str = "tanh"  # "relu" | "tanh"
 
     optimizer: str = "Adam"
     learning_rate_actor: float = 3e-4
     learning_rate_critic: float = 3e-4
     adam_eps: float = 1e-5
 
-    total_timesteps: int = 150000
-    gamma: float = 0.99
+    total_timesteps: int = 5000000
+    gamma: float = 0.9
     gae_lambda: float = 0.95
 
     normalize_reward: bool = True
@@ -103,17 +106,20 @@ class Args:
     clip_gradients: float = 5.0
 
     log_every: int = 10
-    eval_steps: int = 5000
+    eval_steps: int = 100000
     num_eval_ep: int = 5
 
     # Eval / video
-    eval_render: bool = False
-    eval_save_video: bool = False
+    eval_render: bool = True
+    eval_save_video: bool = True
     eval_video_dir: str = "eval_videos"
     eval_video_fps: int = 20
     eval_video_format: str = "mp4"
     eval_video_max_frames: int = 2000
     eval_num_videos_to_save: int = 3
+    # Number of parallel envs used for collecting eval *stats*.
+    # Video recording always uses a separate single-env renderer so it is
+    # unaffected by this value.
     eval_num_envs: int = 1
 
     # W&B / device / seed
@@ -281,13 +287,16 @@ class Actor(nn.Module):
             x = layer(x)
         return x
 
-    def act(self, x, action_scale, action_bias, actions=None):
+    def act(self, x, action_scale, action_bias, actions=None, deterministic=False):
         mean = self.mean(x)
         std = self.logstd_layer.exp().expand_as(mean)
         dist = Normal(mean, std)
 
         if actions is None:
-            u = dist.rsample()
+            if deterministic:
+                u = mean
+            else:
+                u = dist.rsample()
             squashed = torch.tanh(u)
             env_actions = action_scale * squashed + action_bias
         else:
@@ -450,11 +459,70 @@ def _maybe_write_video(frames, out_path: Path, fps: int, fmt: str):
 
     try:
         if fmt == "mp4":
-            imageio.mimsave(str(out_path.with_suffix(".mp4")), cleaned, fps=int(fps))
+            imageio.mimsave(str(out_path.with_suffix(".mp4")), cleaned, fps=int(fps), macro_block_size=1)
         else:
             imageio.mimsave(str(out_path.with_suffix(".gif")), cleaned, fps=int(fps))
     except Exception as e:
         print(f"[warn] failed to save video to {out_path}: {e}")
+
+
+def _record_video_episodes(
+    actor,
+    render_env,
+    action_scale,
+    action_bias,
+    device,
+    video_root: Path,
+    num_videos: int,
+    max_frames: int,
+    fps: int,
+    fmt: str,
+):
+    """
+    Roll out num_videos episodes on the dedicated single-env render_env and
+    save one video file per episode. Completely decoupled from the parallel
+    eval stat collection so eval_num_envs can be any value without breaking
+    video saving. Each episode uses a fixed seed so videos are comparable
+    across training checkpoints.
+    """
+    if not _HAS_IMAGEIO:
+        print("[warn] imageio not available; skipping video save.")
+        return
+
+    for ep_idx in range(num_videos):
+        render_obs, _ = render_env.reset(seed=42 + ep_idx) # fixed seed for comparability
+        frames = []
+        ep_done = False
+
+        while not ep_done and len(frames) < max_frames:
+            frame = None
+            if hasattr(render_env, "render"):
+                frame = render_env.render(mode="rgb_array")
+            if frame is not None:
+                frames.append(frame)
+
+            with torch.no_grad():
+                obs_t = torch.from_numpy(render_obs).float().to(device)
+                actions_t, _, _ = actor.act(
+                    x=obs_t,
+                    action_scale=action_scale,
+                    action_bias=action_bias,
+                    deterministic=True,
+                )
+
+            render_obs, _, done, truncated, _ = render_env.step(actions_t.cpu().numpy())
+
+            done_np = np.asarray(done, dtype=bool).reshape(-1)
+            trunc_np = np.asarray(truncated, dtype=bool).reshape(-1)
+            ep_done = bool(np.any(np.logical_or(done_np, trunc_np)))
+
+        # Pad to at least 5 seconds so short episodes produce watchable videos
+        target_frames = int(5 * fps)
+        if len(frames) > 0 and len(frames) < target_frames:
+            frames.extend([frames[-1]] * (target_frames - len(frames)))
+
+        out_path = video_root / f"eval_ep_{ep_idx}"
+        _maybe_write_video(frames, out_path, fps=fps, fmt=fmt)
 
 
 def _build_vmas_kwargs(args: Args, num_envs: int) -> dict:
@@ -498,6 +566,9 @@ def _build_vmas_kwargs(args: Args, num_envs: int) -> dict:
                 "lidar_range": float(args.vmas_lidar_range),
                 "n_gaussians": int(args.vmas_sampling_n_gaussians),
                 "shared_rew": bool(args.vmas_sampling_shared_rew),
+                "cov": float(args.vmas_sampling_cov),
+                "collisions": bool(args.vmas_sampling_collisions),
+                "spawn_same_pos": bool(args.vmas_sampling_spawn_same_pos),
             }
         )
 
@@ -563,10 +634,18 @@ if __name__ == "__main__":
     device = torch.device(args.device)
 
     kwargs = _build_vmas_kwargs(args, num_envs=args.vmas_num_envs)
+    # Parallel eval envs for fast stat collection
     eval_kwargs = _build_vmas_kwargs(args, num_envs=args.eval_num_envs)
+    # Always num_envs=1 for rendering — VMAS only renders single-env
+    render_kwargs = _build_vmas_kwargs(args, num_envs=1)
 
     env = environment(args.env_type, args.env_name, args.env_family, args.agent_ids, kwargs)
     eval_env = environment(args.env_type, args.env_name, args.env_family, args.agent_ids, eval_kwargs)
+    render_env = (
+        environment(args.env_type, args.env_name, args.env_family, args.agent_ids, render_kwargs)
+        if args.eval_save_video
+        else None
+    )
 
     print(
         "[sanity] n_agents:",
@@ -759,9 +838,17 @@ if __name__ == "__main__":
                 completed_ep_lengths.extend(current_ep_length[ended].tolist())
                 num_episode += len(ended)
 
-                obs, _ = env.reset(seed=args.seed + training_step + int(step))
-                current_ep_reward[:] = 0.0
-                current_ep_length[:] = 0
+                if hasattr(env, "reset_at"):
+                    obs, _ = env.reset_at(ended)
+                else:
+                    obs, _ = env.reset(seed=args.seed + training_step + int(step))
+
+                current_ep_reward[ended] = 0.0
+                current_ep_length[ended] = 0
+
+                if hasattr(env, "reset_at"):
+                    non_ended = np.setdiff1d(np.arange(obs.shape[0]), ended)
+                    obs[non_ended] = next_obs[non_ended]
             else:
                 obs = next_obs
 
@@ -785,15 +872,14 @@ if __name__ == "__main__":
             rewards = rewards / reward_batch_std_used
 
         advantages = torch.zeros_like(rewards, device=device)
-        returns = torch.zeros_like(rewards, device=device)
 
+        # GAE: use dones[t] to mask bootstrapping at the current terminal step
         lastgaelam = torch.zeros((env.num_envs,), dtype=torch.float32, device=device)
         for t in reversed(range(rb.ptr)):
+            nextnonterminal = 1.0 - dones[t]
             if t == rb.ptr - 1:
-                nextnonterminal = 1.0 - dones[t]
                 nextvalues = next_value
             else:
-                nextnonterminal = 1.0 - dones[t + 1]
                 nextvalues = values[t + 1]
 
             delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
@@ -907,7 +993,9 @@ if __name__ == "__main__":
         clipped_ratios = []
 
         total_step_samples = T * E
-        step_minibatch_size = total_step_samples if args.ppo_minibatch_size <= 0 else min(args.ppo_minibatch_size, total_step_samples)
+        step_minibatch_size = (
+            total_step_samples if args.ppo_minibatch_size <= 0 else min(args.ppo_minibatch_size, total_step_samples)
+        )
         agent_offsets = torch.arange(N, device=device).unsqueeze(0)
 
         for _ in range(args.ppo_epochs):
@@ -1055,10 +1143,12 @@ if __name__ == "__main__":
             video_root = Path(args.eval_video_dir) / run_name / f"step_{step}"
             video_root.mkdir(parents=True, exist_ok=True)
             print(
-                f"[eval] step={step} saving={args.eval_save_video} "
-                f"eval_num_envs={args.eval_num_envs} num_eval_ep={args.num_eval_ep}"
+                f"[eval] step={step} eval_num_envs={args.eval_num_envs} num_eval_ep={args.num_eval_ep}"
             )
 
+            # -------------------------
+            # Fast parallel stat collection (any eval_num_envs)
+            # -------------------------
             eval_obs, _ = eval_env.reset()
 
             eval_envs = int(np.asarray(eval_obs).shape[0])
@@ -1070,23 +1160,14 @@ if __name__ == "__main__":
             eval_current_reward = np.zeros((eval_envs,), dtype=np.float32)
             eval_current_ep_length = np.zeros((eval_envs,), dtype=np.int32)
 
-            frames = []
-            save_video_this_eval = bool(args.eval_save_video) and eval_envs == 1
-
             while eval_completed < args.num_eval_ep:
-                if (args.eval_render or save_video_this_eval) and eval_envs == 1:
-                    frame = None
-                    if hasattr(eval_env, "render"):
-                        frame = eval_env.render(mode="rgb_array")
-                    if frame is not None and len(frames) < int(args.eval_video_max_frames):
-                        frames.append(frame)
-
                 with torch.no_grad():
                     eval_obs_t = torch.from_numpy(eval_obs).float().to(device)
                     eval_actions, _, _ = actor.act(
                         x=eval_obs_t,
                         action_scale=action_scale,
                         action_bias=action_bias,
+                        deterministic=True,
                     )
 
                 next_obs_, reward, done, truncated, _ = eval_env.step(eval_actions.cpu().numpy())
@@ -1123,21 +1204,17 @@ if __name__ == "__main__":
                     eval_ep_reward.extend(eval_current_reward[to_take].tolist())
                     eval_ep_length.extend(eval_current_ep_length[to_take].tolist())
 
-                    if save_video_this_eval and eval_completed < int(args.eval_num_videos_to_save):
-                        out_path = video_root / f"eval_ep_{eval_completed}"
-                        _maybe_write_video(
-                            frames,
-                            out_path,
-                            fps=int(args.eval_video_fps),
-                            fmt=args.eval_video_format,
-                        )
-
                     eval_current_reward[ended] = 0.0
                     eval_current_ep_length[ended] = 0
                     eval_completed += len(to_take)
 
-                    if save_video_this_eval:
-                        frames = []
+                    if hasattr(eval_env, "reset_at"):
+                        eval_obs_new, _ = eval_env.reset_at(ended)
+                        non_ended = np.setdiff1d(np.arange(eval_obs.shape[0]), ended)
+                        eval_obs_new[non_ended] = eval_obs[non_ended]
+                        eval_obs = eval_obs_new
+                    else:
+                        eval_obs, _ = eval_env.reset()
 
                 if eval_completed >= args.num_eval_ep:
                     break
@@ -1145,6 +1222,24 @@ if __name__ == "__main__":
             writer.add_scalar("eval/ep_return_raw_team_mean", float(np.mean(eval_ep_reward)), step)
             writer.add_scalar("eval/ep_return_raw_team_std", float(np.std(eval_ep_reward)), step)
             writer.add_scalar("eval/ep_length_mean", float(np.mean(eval_ep_length)), step)
+
+            # -------------------------
+            # Video recording via dedicated single-env renderer
+            # Runs after stats so eval speed is not affected
+            # -------------------------
+            if args.eval_save_video and render_env is not None:
+                _record_video_episodes(
+                    actor=actor,
+                    render_env=render_env,
+                    action_scale=action_scale,
+                    action_bias=action_bias,
+                    device=device,
+                    video_root=video_root,
+                    num_videos=args.eval_num_videos_to_save,
+                    max_frames=args.eval_video_max_frames,
+                    fps=args.eval_video_fps,
+                    fmt=args.eval_video_format,
+                )
 
             next_eval_step += int(args.eval_steps)
 
@@ -1155,3 +1250,5 @@ if __name__ == "__main__":
 
     env.close()
     eval_env.close()
+    if render_env is not None:
+        render_env.close()

@@ -144,8 +144,13 @@ class Args:
     # advantage gating
     adv_keep_frac: float = 0.2
     adv_alpha_ema_beta: float = 0.9   # kept for interface parity, unused
-    adv_alpha_window: int = 5000      # kept for interface parity, unused
+    # How many recent scores to keep per cluster when estimating the
+    # discard threshold. Renamed from adv_alpha_window for clarity.
+    cluster_score_window_size: int = 5000
     adv_warmup_steps: int = 5000
+    # Weight applied to discarded transitions in soft-discard mode.
+    # 0.0 = full hard discard, 1.0 = no discarding at all.
+    soft_discard_weight: float = 0.1
 
     # clustering
     cluster_enabled: bool = False
@@ -232,7 +237,9 @@ class RolloutBuffer:
         self.values = torch.zeros((T, E), dtype=torch.float32, device=self.device)
 
         # semantic metadata per step/env
-        self.keep_mask = torch.ones((T, E), dtype=torch.bool, device=self.device)
+        # keep_mask stores per-transition weights in [soft_discard_weight, 1.0]
+        # rather than a bool, so soft discarding is handled naturally downstream.
+        self.keep_mask = torch.ones((T, E), dtype=torch.float32, device=self.device)
         self.semantic_score = torch.zeros((T, E), dtype=torch.float32, device=self.device)
 
         self.ptr = 0
@@ -259,7 +266,7 @@ class RolloutBuffer:
         self.values[t] = values
 
         if keep_mask is None:
-            self.keep_mask[t] = torch.ones((self.num_envs,), dtype=torch.bool, device=self.device)
+            self.keep_mask[t] = torch.ones((self.num_envs,), dtype=torch.float32, device=self.device)
         else:
             self.keep_mask[t] = keep_mask
 
@@ -490,7 +497,7 @@ def _record_video_episodes(
         return
 
     for ep_idx in range(num_videos):
-        render_obs, _ = render_env.reset(seed=42 + ep_idx) # fixed seed for comparability
+        render_obs, _ = render_env.reset(seed=42 + ep_idx)
         frames = []
         ep_done = False
 
@@ -756,6 +763,10 @@ if __name__ == "__main__":
     while step < args.total_timesteps:
         rb.reset()
 
+        # FIX: record step count at the START of the rollout so the warmup
+        # comparison is not off by a full rollout's worth of steps.
+        step_at_rollout_start = step
+
         last_cluster_entropy = 0.0
         last_num_clusters = 1.0
         last_mean_policy_dist = 0.0
@@ -798,7 +809,15 @@ if __name__ == "__main__":
                     infos.get("semantic_score", np.zeros((env.num_envs,), dtype=np.float32))
                 ).reshape(-1)
 
-                step_keep_mask_t = torch.from_numpy(step_keep_mask_np).bool().to(device)
+                # Convert bool keep mask to float weights for soft discarding:
+                # kept transitions get weight 1.0, discarded get soft_discard_weight
+                step_keep_weights = np.where(
+                    step_keep_mask_np,
+                    1.0,
+                    float(args.soft_discard_weight),
+                ).astype(np.float32)
+
+                step_keep_mask_t = torch.from_numpy(step_keep_weights).float().to(device)
                 step_semantic_score_t = torch.from_numpy(step_semantic_score_np).float().to(device)
 
             rb.add(
@@ -888,6 +907,11 @@ if __name__ == "__main__":
 
         returns = advantages + values
 
+        # Save unnormalised advantages before normalisation so the semantic
+        # selection threshold is calibrated against real advantage magnitudes,
+        # not z-scored values that are always roughly unit-variance.
+        advantages_unnorm = advantages.clone()
+
         if args.normalize_advantage:
             adv_mean = advantages.mean()
             adv_std = torch.clamp(advantages.std(), min=1e-6)
@@ -899,7 +923,10 @@ if __name__ == "__main__":
             returns = (returns - ret_mean) / ret_std
 
         # -------------------------
-        # Semantic selection
+        # Semantic selection (advantage mode)
+        # Runs after GAE so we can score transitions by unnormalised advantage.
+        # Produces per-transition float weights in [soft_discard_weight, 1.0]
+        # stored in rb.keep_mask, used in the PPO update below.
         # -------------------------
         if args.semantic_enabled and args.semantic_mode == "advantage":
             for t in range(rb.ptr):
@@ -920,7 +947,8 @@ if __name__ == "__main__":
                         clusters = [list(range(env.n_agents))]
                         cstats = {"mean_pairwise_policy_dist": 0.0, "num_clusters": 1.0}
 
-                    abs_adv_scalar = float(torch.abs(advantages[t, e]).detach().cpu().item())
+                    # Use unnormalised advantage so the threshold is meaningful
+                    abs_adv_scalar = float(torch.abs(advantages_unnorm[t, e]).detach().cpu().item())
                     agent_scores = np.full((env.n_agents,), abs_adv_scalar, dtype=np.float32)
 
                     cluster_scores = {}
@@ -935,6 +963,13 @@ if __name__ == "__main__":
 
                         cluster_score_windows[cluster_key].append(score)
 
+                        # FIX: cap the window so old scores don't dominate the
+                        # threshold and memory doesn't grow unboundedly.
+                        if len(cluster_score_windows[cluster_key]) > args.cluster_score_window_size:
+                            cluster_score_windows[cluster_key] = (
+                                cluster_score_windows[cluster_key][-args.cluster_score_window_size:]
+                            )
+
                         if len(cluster_score_windows[cluster_key]) >= 100:
                             q = float(
                                 np.quantile(
@@ -944,16 +979,21 @@ if __name__ == "__main__":
                             )
                             cluster_alpha[cluster_key] = q
 
-                    if step < args.adv_warmup_steps:
-                        keep = True
+                    # FIX: compare against step count at the START of this
+                    # rollout, not the end, so warmup isn't off by a full rollout.
+                    if step_at_rollout_start < args.adv_warmup_steps:
+                        # During warmup all transitions get full weight
+                        transition_weight = 1.0
                     else:
                         passed = [
                             float(score) >= float(cluster_alpha.get(cluster_key, 0.0))
                             for cluster_key, score in cluster_scores.items()
                         ]
                         keep = bool(all(passed)) if args.cluster_keep_rule == "all" else bool(any(passed))
+                        # Soft discard: downweight rather than zero out
+                        transition_weight = 1.0 if keep else float(args.soft_discard_weight)
 
-                    rb.keep_mask[t, e] = bool(keep)
+                    rb.keep_mask[t, e] = transition_weight
                     rb.semantic_score[t, e] = float(np.mean(agent_scores))
 
                     last_cluster_entropy = _shannon_entropy_of_cluster_sizes(clusters, env.n_agents)
@@ -961,7 +1001,9 @@ if __name__ == "__main__":
                     last_mean_policy_dist = float(cstats["mean_pairwise_policy_dist"])
 
         semantic_total_steps += int(rb.ptr * env.num_envs)
-        semantic_kept_steps += int(rb.keep_mask[:rb.ptr].sum().item())
+        # For logging, count a transition as "kept" if its weight is above the
+        # soft discard weight (i.e. it was not downweighted).
+        semantic_kept_steps += int((rb.keep_mask[:rb.ptr] > float(args.soft_discard_weight) + 1e-6).sum().item())
 
         # -------------------------
         # Flatten for PPO update
@@ -976,13 +1018,10 @@ if __name__ == "__main__":
         b_states = rb.states[:T].reshape(T * E, env.get_state_size())
         b_returns = returns[:T].reshape(T * E)
 
-        b_keep_step = rb.keep_mask[:T].reshape(T * E)
-        b_keep_agent = rb.keep_mask[:T].unsqueeze(-1).expand(T, E, N).reshape(T * E * N)
-
-        if b_keep_step.sum().item() == 0:
-            b_keep_step = torch.ones_like(b_keep_step, dtype=torch.bool, device=device)
-        if b_keep_agent.sum().item() == 0:
-            b_keep_agent = torch.ones_like(b_keep_agent, dtype=torch.bool, device=device)
+        # Per-transition weights in [soft_discard_weight, 1.0]
+        # shape: (T*E,) for critic, (T*E*N,) for actor
+        b_weights_step = rb.keep_mask[:T].reshape(T * E)
+        b_weights_agent = rb.keep_mask[:T].unsqueeze(-1).expand(T, E, N).reshape(T * E * N)
 
         actor_losses = []
         critic_losses = []
@@ -1013,13 +1052,8 @@ if __name__ == "__main__":
                 mb_states = b_states[idx_step]
                 mb_returns = b_returns[idx_step]
 
-                mb_keep_step = b_keep_step[idx_step]
-                mb_keep_agent = b_keep_agent[idx_agent]
-
-                if mb_keep_step.sum().item() == 0:
-                    mb_keep_step = torch.ones_like(mb_keep_step, dtype=torch.bool, device=device)
-                if mb_keep_agent.sum().item() == 0:
-                    mb_keep_agent = torch.ones_like(mb_keep_agent, dtype=torch.bool, device=device)
+                mb_weights_step = b_weights_step[idx_step]
+                mb_weights_agent = b_weights_agent[idx_agent]
 
                 _, current_logprob, current_entropy = actor.act(
                     x=mb_obs,
@@ -1033,21 +1067,27 @@ if __name__ == "__main__":
 
                 pg_loss1 = mb_advantages * ratio
                 pg_loss2 = mb_advantages * torch.clamp(ratio, 1 - args.ppo_clip, 1 + args.ppo_clip)
+                pg_loss = -torch.min(pg_loss1, pg_loss2)
 
                 if args.semantic_enabled:
-                    actor_loss = -torch.min(pg_loss1[mb_keep_agent], pg_loss2[mb_keep_agent]).mean()
-                    entropy_bonus = current_entropy[mb_keep_agent].mean()
+                    # Soft discard: weight each transition's loss contribution.
+                    # Downweighted transitions still contribute but with reduced
+                    # influence, avoiding the instability of hard zeroing.
+                    actor_loss = (pg_loss * mb_weights_agent).mean()
+                    entropy_bonus = (current_entropy * mb_weights_agent).mean()
                 else:
-                    actor_loss = -torch.min(pg_loss1, pg_loss2).mean()
+                    actor_loss = pg_loss.mean()
                     entropy_bonus = current_entropy.mean()
 
                 total_actor_loss = actor_loss - args.entropy_coef * entropy_bonus
 
                 current_values = critic(mb_states)
+                per_step_critic_loss = F.mse_loss(current_values, mb_returns, reduction="none")
+
                 if args.semantic_enabled:
-                    critic_loss = F.mse_loss(current_values[mb_keep_step], mb_returns[mb_keep_step])
+                    critic_loss = (per_step_critic_loss * mb_weights_step).mean()
                 else:
-                    critic_loss = F.mse_loss(current_values, mb_returns)
+                    critic_loss = per_step_critic_loss.mean()
 
                 total_loss = total_actor_loss + args.value_coef * critic_loss
 
@@ -1065,12 +1105,8 @@ if __name__ == "__main__":
                 actor_optimizer.step()
                 critic_optimizer.step()
 
-                if args.semantic_enabled:
-                    approx_kl = ((ratio[mb_keep_agent] - 1) - log_ratio[mb_keep_agent]).mean()
-                    clipped_ratio = ((ratio[mb_keep_agent] - 1.0).abs() > args.ppo_clip).float().mean()
-                else:
-                    approx_kl = ((ratio - 1) - log_ratio).mean()
-                    clipped_ratio = ((ratio - 1.0).abs() > args.ppo_clip).float().mean()
+                approx_kl = ((ratio - 1) - log_ratio).mean()
+                clipped_ratio = ((ratio - 1.0).abs() > args.ppo_clip).float().mean()
 
                 training_step += 1
 
@@ -1120,7 +1156,7 @@ if __name__ == "__main__":
         if args.semantic_enabled and num_episode % args.semantic_log_every == 0:
             writer.add_scalar(
                 "semantic/buffer_keep_rate",
-                float(rb.keep_mask[:rb.ptr].float().mean().item()) if rb.ptr > 0 else 1.0,
+                float(rb.keep_mask[:rb.ptr].mean().item()) if rb.ptr > 0 else 1.0,
                 step,
             )
             writer.add_scalar(
@@ -1129,6 +1165,7 @@ if __name__ == "__main__":
                 step,
             )
             writer.add_scalar("semantic/adv_keep_frac_target", float(args.adv_keep_frac), step)
+            writer.add_scalar("semantic/soft_discard_weight", float(args.soft_discard_weight), step)
 
             if len(cluster_alpha) > 0:
                 writer.add_scalar("semantic/adv_alpha_mean", float(np.mean(list(cluster_alpha.values()))), step)

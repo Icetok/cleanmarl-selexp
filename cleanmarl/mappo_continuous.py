@@ -139,6 +139,14 @@ class Args:
     # advantage gating
     adv_keep_frac: float = 0.2
     adv_warmup_steps: int = 5000
+    adv_min_keep_frac: float = 0.1
+    adv_positive_only: bool = True
+    adv_use_abs: bool = False
+
+    typicality_enabled: bool = True
+    typicality_min_quantile: float = 0.1
+    typicality_weight: float = 0.5
+    typicality_num_refs: int = 2048
 
     # clustering
     cluster_enabled: bool = False
@@ -794,13 +802,8 @@ if __name__ == "__main__":
                     infos.get("semantic_score", np.zeros((env.num_envs,), dtype=np.float32))
                 ).reshape(-1)
 
-                # Convert bool keep mask to float weights for soft discarding:
-                # kept transitions get weight 1.0, discarded get soft_discard_weight
-                step_keep_weights = np.where(
-                    step_keep_mask_np,
-                    1.0,
-                    float(args.soft_discard_weight),
-                ).astype(np.float32)
+                # Hard keep/discard mask
+                step_keep_weights = step_keep_mask_np.astype(np.float32)
 
                 step_keep_mask_t = torch.from_numpy(step_keep_weights).float().to(device)
                 step_semantic_score_t = torch.from_numpy(step_semantic_score_np).float().to(device)
@@ -914,21 +917,92 @@ if __name__ == "__main__":
         # stored in rb.keep_mask, used in the PPO update below.
         # -------------------------
         if args.semantic_enabled and args.semantic_mode == "advantage":
-            # Compute threshold from the current rollout only.
-            # This keeps MAPPO on-policy and avoids carrying a score window across updates.
-            rollout_abs_adv = torch.abs(advantages_unnorm[:rb.ptr]).detach()
-            adv_threshold = torch.quantile(
-                rollout_abs_adv.reshape(-1),
-                float(args.adv_keep_frac),
-            ).item()
+            adv_raw = advantages_unnorm[:rb.ptr].detach()  # (T, E)
 
-            for t in range(rb.ptr):
-                for e in range(env.num_envs):
-                    obs_np = rb.obs[t, e].detach().cpu().numpy()
-                    act_np = rb.actions[t, e].detach().cpu().numpy()
-                    obs_base = _strip_agent_ids(obs_np, env.n_agents, args.agent_ids)
+            # 1) Advantage score: TD-error-inspired, but translated to MAPPO advantage.
+            if args.adv_use_abs:
+                adv_score = torch.abs(adv_raw)
+            elif args.adv_positive_only:
+                adv_score = torch.clamp(adv_raw, min=0.0)
+            else:
+                adv_score = adv_raw
 
-                    if args.cluster_enabled:
+            # 2) Trajectory/state typicality proxy.
+            # Here we estimate "how likely/common" the trajectory is by how close each
+            # state is to other states in the current rollout. Smaller distance = more typical.
+            flat_states = rb.states[:rb.ptr].detach().reshape(rb.ptr * env.num_envs, env.get_state_size())
+
+            if args.typicality_enabled and flat_states.shape[0] > 1:
+                with torch.no_grad():
+                    num_states = flat_states.shape[0]
+                    num_refs = min(int(args.typicality_num_refs), num_states)
+
+                    ref_idx = torch.randperm(num_states, device=flat_states.device)[:num_refs]
+                    ref_states = flat_states[ref_idx]
+
+                    dists = torch.cdist(flat_states, ref_states)
+                    knn_dist = torch.min(dists, dim=1).values
+                    typicality = 1.0 / (knn_dist + 1e-6)
+                    typicality = typicality.reshape(rb.ptr, env.num_envs)
+
+                    # Normalize for stable combination with advantage.
+                    typicality_norm = typicality / torch.clamp(typicality.mean(), min=1e-6)
+                    adv_norm = adv_score / torch.clamp(adv_score.mean(), min=1e-6)
+
+                    combined_score = adv_norm * (typicality_norm ** float(args.typicality_weight))
+
+                    # Optional: do not keep extremely rare states even if advantage is high.
+                    typicality_cutoff = torch.quantile(
+                        typicality.reshape(-1),
+                        float(args.typicality_min_quantile),
+                    )
+                    typical_enough = typicality >= typicality_cutoff
+            else:
+                combined_score = adv_score
+                typical_enough = torch.ones_like(adv_score, dtype=torch.bool)
+
+            total_transitions = combined_score.numel()
+            min_keep = max(1, int(float(args.adv_min_keep_frac) * total_transitions))
+
+            if step_at_rollout_start < args.adv_warmup_steps:
+                use_selection = False
+                score_threshold = None
+            else:
+                candidate_scores = combined_score[typical_enough]
+
+                if candidate_scores.numel() < min_keep:
+                    use_selection = False
+                    score_threshold = None
+                else:
+                    # Keep upper quantile of useful/typical experiences.
+                    q = 1.0 - float(args.adv_keep_frac)
+                    score_threshold = torch.quantile(candidate_scores, q).item()
+                    use_selection = True
+
+            keep_mask = torch.ones_like(combined_score, dtype=torch.float32)
+
+            if use_selection:
+                keep_mask = ((combined_score >= float(score_threshold)) & typical_enough).float()
+
+                # Safety: enforce minimum amount of data.
+                if int(keep_mask.sum().item()) < min_keep:
+                    flat_score = combined_score.reshape(-1)
+                    top_idx = torch.topk(flat_score, k=min_keep, largest=True).indices
+                    keep_mask = torch.zeros_like(flat_score)
+                    keep_mask[top_idx] = 1.0
+                    keep_mask = keep_mask.reshape(rb.ptr, env.num_envs)
+
+            rb.keep_mask[:rb.ptr] = keep_mask
+            rb.semantic_score[:rb.ptr] = combined_score.float()
+
+            # Keep cluster diagnostics unchanged.
+            if args.cluster_enabled:
+                for t in range(rb.ptr):
+                    for e in range(env.num_envs):
+                        obs_np = rb.obs[t, e].detach().cpu().numpy()
+                        act_np = rb.actions[t, e].detach().cpu().numpy()
+                        obs_base = _strip_agent_ids(obs_np, env.n_agents, args.agent_ids)
+
                         clusters, _, cstats = _build_clusters_continuous(
                             obs_base=obs_base,
                             policy_vecs=act_np,
@@ -936,38 +1010,10 @@ if __name__ == "__main__":
                             prox_radius=args.cluster_proximity_radius,
                             policy_dist_thresh=args.cluster_policy_dist_thresh,
                         )
-                    else:
-                        clusters = [list(range(env.n_agents))]
-                        cstats = {"mean_pairwise_policy_dist": 0.0, "num_clusters": 1.0}
 
-                    # Use unnormalised absolute advantage, so both unexpectedly good
-                    # and unexpectedly bad transitions are treated as informative.
-                    abs_adv_scalar = float(torch.abs(advantages_unnorm[t, e]).detach().cpu().item())
-                    agent_scores = np.full((env.n_agents,), abs_adv_scalar, dtype=np.float32)
-
-                    cluster_scores = {}
-                    for comp in clusters:
-                        cluster_key = tuple(sorted(comp))
-                        score = float(np.mean(agent_scores[np.asarray(comp, dtype=np.int64)]))
-                        cluster_scores[cluster_key] = score
-
-                    if step_at_rollout_start < args.adv_warmup_steps:
-                        transition_weight = 1.0
-                    else:
-                        passed = [
-                            float(score) <= float(adv_threshold)
-                            for score in cluster_scores.values()
-                        ]
-                        keep = bool(all(passed)) if args.cluster_keep_rule == "all" else bool(any(passed))
-                        transition_weight = 1.0 if keep else 0.0
-
-                    rb.keep_mask[t, e] = transition_weight
-                    rb.semantic_score[t, e] = float(np.mean(agent_scores))
-
-                    # Keep cluster diagnostics unchanged.
-                    last_cluster_entropy = _shannon_entropy_of_cluster_sizes(clusters, env.n_agents)
-                    last_num_clusters = float(len(clusters))
-                    last_mean_policy_dist = float(cstats["mean_pairwise_policy_dist"])
+                        last_cluster_entropy = _shannon_entropy_of_cluster_sizes(clusters, env.n_agents)
+                        last_num_clusters = float(len(clusters))
+                        last_mean_policy_dist = float(cstats["mean_pairwise_policy_dist"])
 
         semantic_total_steps += int(rb.ptr * env.num_envs)
         # For logging, count a transition as "kept" if its weight is above the

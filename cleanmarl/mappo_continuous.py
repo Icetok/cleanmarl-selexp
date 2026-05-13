@@ -940,7 +940,14 @@ if __name__ == "__main__":
                     ref_idx = torch.randperm(num_states, device=flat_states.device)[:num_refs]
                     ref_states = flat_states[ref_idx]
 
+                    # Avoid self-distance = 0 for states that are also in the reference set
                     dists = torch.cdist(flat_states, ref_states)
+
+                    # Only fix self-distance for rows that are actually reference states
+                    dists[ref_idx, torch.arange(num_refs, device=flat_states.device)] = float("inf")
+
+                    knn_dist = torch.min(dists, dim=1).values
+
                     knn_dist = torch.min(dists, dim=1).values
                     typicality = 1.0 / (knn_dist + 1e-6)
                     typicality = typicality.reshape(rb.ptr, env.num_envs)

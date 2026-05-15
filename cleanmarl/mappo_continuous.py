@@ -140,10 +140,10 @@ class Args:
     adv_keep_frac: float = 0.2
     adv_warmup_steps: int = 5000
     adv_min_keep_frac: float = 0.1
-    adv_positive_only: bool = True
+    adv_positive_only: bool = False
     adv_use_abs: bool = False
 
-    typicality_enabled: bool = True
+    typicality_enabled: bool = False
     typicality_min_quantile: float = 0.1
     typicality_weight: float = 0.5
     typicality_num_refs: int = 2048
@@ -977,14 +977,28 @@ if __name__ == "__main__":
             else:
                 candidate_scores = combined_score[typical_enough]
 
-                if candidate_scores.numel() < min_keep:
+                # Only remove zeros if they were artificially introduced by adv_positive_only
+                # clamping. Otherwise zeros are real scores and should be included.
+                if args.adv_positive_only:
+                    nonzero_mask = candidate_scores > 0.0
+                    nonzero_scores = candidate_scores[nonzero_mask]
+                else:
+                    nonzero_scores = candidate_scores
+
+                if nonzero_scores.numel() < min_keep:
                     use_selection = False
                     score_threshold = None
                 else:
-                    # Keep upper quantile of useful/typical experiences.
-                    q = 1.0 - float(args.adv_keep_frac)
-                    score_threshold = torch.quantile(candidate_scores, q).item()
-                    use_selection = True
+                    score_min = nonzero_scores.min().item()
+                    score_max = nonzero_scores.max().item()
+                    score_range = score_max - score_min
+
+                    if score_range < 1e-8:
+                        use_selection = False
+                        score_threshold = None
+                    else:
+                        score_threshold = score_min + (1.0 - float(args.adv_keep_frac)) * score_range
+                        use_selection = True
 
             keep_mask = torch.ones_like(combined_score, dtype=torch.float32)
 

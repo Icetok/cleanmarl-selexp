@@ -142,11 +142,8 @@ class Args:
     adv_min_keep_frac: float = 0.1
     adv_positive_only: bool = False
     adv_use_abs: bool = False
-
-    typicality_enabled: bool = False
-    typicality_min_quantile: float = 0.1
-    typicality_weight: float = 0.5
-    typicality_num_refs: int = 2048
+    
+    cf_advantage_enabled: bool = False
 
     # clustering
     cluster_enabled: bool = False
@@ -228,6 +225,7 @@ class RolloutBuffer:
         self.actions = torch.zeros((T, E, N, A), dtype=torch.float32, device=self.device)
         self.log_probs = torch.zeros((T, E, N), dtype=torch.float32, device=self.device)
         self.rewards = torch.zeros((T, E), dtype=torch.float32, device=self.device)
+        self.rewards_agents = torch.zeros((T, E, N), dtype=torch.float32, device=self.device)
         self.states = torch.zeros((T, E, S), dtype=torch.float32, device=self.device)
         self.dones = torch.zeros((T, E), dtype=torch.float32, device=self.device)
         self.values = torch.zeros((T, E), dtype=torch.float32, device=self.device)
@@ -236,6 +234,7 @@ class RolloutBuffer:
         # keep_mask stores whether each transition is used in the PPO update.
         # rather than a bool, so soft discarding is handled naturally downstream.
         self.keep_mask = torch.ones((T, E), dtype=torch.float32, device=self.device)
+        self.keep_mask_agent = torch.ones((T, E, N), dtype=torch.float32, device=self.device)
         self.semantic_score = torch.zeros((T, E), dtype=torch.float32, device=self.device)
 
         self.ptr = 0
@@ -250,6 +249,7 @@ class RolloutBuffer:
         dones,
         values,
         keep_mask=None,
+        reward_agents=None,
         semantic_score=None,
     ):
         t = self.ptr
@@ -257,6 +257,10 @@ class RolloutBuffer:
         self.actions[t] = actions
         self.log_probs[t] = log_probs
         self.rewards[t] = rewards
+        if reward_agents is None:
+            self.rewards_agents[t] = rewards.unsqueeze(-1).expand(self.num_envs, self.num_agents)
+        else:
+            self.rewards_agents[t] = reward_agents
         self.states[t] = states
         self.dones[t] = dones
         self.values[t] = values
@@ -786,6 +790,10 @@ if __name__ == "__main__":
             next_obs, reward, done, truncated, infos = env.step(actions_np)
 
             reward_np = np.asarray(reward, dtype=np.float32).reshape(-1)
+            reward_agents_np = np.asarray(
+                infos.get("reward_agents", np.repeat(reward_np[:, None], env.n_agents, axis=1)),
+                dtype=np.float32,
+            )
             done_np = np.asarray(done, dtype=bool).reshape(-1)
             trunc_np = np.asarray(truncated, dtype=bool).reshape(-1)
             terminal_np = np.logical_or(done_np, trunc_np).astype(np.float32)
@@ -818,6 +826,7 @@ if __name__ == "__main__":
                 values=values_t,
                 keep_mask=step_keep_mask_t,
                 semantic_score=step_semantic_score_t,
+                reward_agents=torch.from_numpy(reward_agents_np).float().to(device),
             )
 
             if args.cluster_enabled:
@@ -879,6 +888,7 @@ if __name__ == "__main__":
             rewards = rewards / reward_batch_std_used
 
         advantages = torch.zeros_like(rewards, device=device)
+        td_errors = torch.zeros_like(rewards, device=device) # NEW: Track TD errors
 
         # GAE: use dones[t] to mask bootstrapping at the current terminal step
         lastgaelam = torch.zeros((env.num_envs,), dtype=torch.float32, device=device)
@@ -890,6 +900,7 @@ if __name__ == "__main__":
                 nextvalues = values[t + 1]
 
             delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
+            td_errors[t] = delta # NEW: Save the immediate surprise
             lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
             advantages[t] = lastgaelam
 
@@ -899,6 +910,33 @@ if __name__ == "__main__":
         # selection threshold is calibrated against real advantage magnitudes,
         # not z-scored values that are always roughly unit-variance.
         advantages_unnorm = advantages.clone()
+        
+        cf_advantages_unnorm = None
+
+        if args.cf_advantage_enabled:
+            agent_rewards = rb.rewards_agents[:rb.ptr]
+
+            if args.normalize_reward and reward_batch_std_used is not None:
+                agent_rewards = agent_rewards / reward_batch_std_used
+
+            reward_sum = agent_rewards.sum(dim=-1, keepdim=True)
+
+            if env.n_agents > 1:
+                other_mean = (reward_sum - agent_rewards) / float(env.n_agents - 1)
+            else:
+                other_mean = torch.zeros_like(agent_rewards)
+
+            cf_rewards = agent_rewards - other_mean
+
+            cf_advantages = torch.zeros_like(cf_rewards, device=device)
+            last_cf = torch.zeros((env.num_envs, env.n_agents), dtype=torch.float32, device=device)
+
+            for t in reversed(range(rb.ptr)):
+                nextnonterminal = (1.0 - dones[t]).unsqueeze(-1)
+                last_cf = cf_rewards[t] + args.gamma * args.gae_lambda * nextnonterminal * last_cf
+                cf_advantages[t] = last_cf
+
+            cf_advantages_unnorm = cf_advantages.clone()
 
         if args.normalize_advantage:
             adv_mean = advantages.mean()
@@ -912,12 +950,14 @@ if __name__ == "__main__":
 
         # -------------------------
         # Semantic selection (advantage mode)
-        # Runs after GAE so we can score transitions by unnormalised advantage.
-        # Produces per-transition float weights in [soft_discard_weight, 1.0]
-        # stored in rb.keep_mask, used in the PPO update below.
         # -------------------------
+        score_threshold = None
+        
         if args.semantic_enabled and args.semantic_mode == "advantage":
-            adv_raw = advantages_unnorm[:rb.ptr].detach()  # (T, E)
+            if args.cf_advantage_enabled and cf_advantages_unnorm is not None:
+                adv_raw = cf_advantages_unnorm[:rb.ptr].detach()  # (T, E, N)
+            else:
+                adv_raw = advantages_unnorm[:rb.ptr].detach()     # (T, E)
 
             # 1) Advantage score: TD-error-inspired, but translated to MAPPO advantage.
             if args.adv_use_abs:
@@ -927,94 +967,76 @@ if __name__ == "__main__":
             else:
                 adv_score = adv_raw
 
-            # 2) Trajectory/state typicality proxy.
-            # Here we estimate "how likely/common" the trajectory is by how close each
-            # state is to other states in the current rollout. Smaller distance = more typical.
-            flat_states = rb.states[:rb.ptr].detach().reshape(rb.ptr * env.num_envs, env.get_state_size())
-
-            if args.typicality_enabled and flat_states.shape[0] > 1:
-                with torch.no_grad():
-                    num_states = flat_states.shape[0]
-                    num_refs = min(int(args.typicality_num_refs), num_states)
-
-                    ref_idx = torch.randperm(num_states, device=flat_states.device)[:num_refs]
-                    ref_states = flat_states[ref_idx]
-
-                    # Avoid self-distance = 0 for states that are also in the reference set
-                    dists = torch.cdist(flat_states, ref_states)
-
-                    # Only fix self-distance for rows that are actually reference states
-                    dists[ref_idx, torch.arange(num_refs, device=flat_states.device)] = float("inf")
-
-                    knn_dist = torch.min(dists, dim=1).values
-
-                    knn_dist = torch.min(dists, dim=1).values
-                    typicality = 1.0 / (knn_dist + 1e-6)
-                    typicality = typicality.reshape(rb.ptr, env.num_envs)
-
-                    # Normalize for stable combination with advantage.
-                    typicality_norm = typicality / torch.clamp(typicality.mean(), min=1e-6)
-                    adv_norm = adv_score / torch.clamp(adv_score.mean(), min=1e-6)
-
-                    combined_score = adv_norm * (typicality_norm ** float(args.typicality_weight))
-
-                    # Optional: do not keep extremely rare states even if advantage is high.
-                    typicality_cutoff = torch.quantile(
-                        typicality.reshape(-1),
-                        float(args.typicality_min_quantile),
-                    )
-                    typical_enough = typicality >= typicality_cutoff
-            else:
-                combined_score = adv_score
-                typical_enough = torch.ones_like(adv_score, dtype=torch.bool)
+            combined_score = adv_score
+            eligible_enough = torch.ones_like(adv_score, dtype=torch.bool)
 
             total_transitions = combined_score.numel()
             min_keep = max(1, int(float(args.adv_min_keep_frac) * total_transitions))
 
             if step_at_rollout_start < args.adv_warmup_steps:
-                use_selection = False
+                keep_mask = torch.ones_like(combined_score, dtype=torch.float32)
                 score_threshold = None
             else:
-                candidate_scores = combined_score[typical_enough]
+                eligible_mask = eligible_enough.clone()
 
-                # Only remove zeros if they were artificially introduced by adv_positive_only
-                # clamping. Otherwise zeros are real scores and should be included.
                 if args.adv_positive_only:
-                    nonzero_mask = candidate_scores > 0.0
-                    nonzero_scores = candidate_scores[nonzero_mask]
-                else:
-                    nonzero_scores = candidate_scores
+                    eligible_mask = eligible_mask & (adv_score > 0.0)
 
-                if nonzero_scores.numel() < min_keep:
-                    use_selection = False
+                eligible_idx = torch.nonzero(eligible_mask.reshape(-1), as_tuple=False).squeeze(-1)
+                flat_scores = combined_score.reshape(-1)
+
+                if eligible_idx.numel() < min_keep:
+                    # Not enough meaningful candidates; do not force a tiny biased update.
+                    keep_mask = torch.ones_like(combined_score, dtype=torch.float32)
                     score_threshold = None
                 else:
-                    score_min = nonzero_scores.min().item()
-                    score_max = nonzero_scores.max().item()
-                    score_range = score_max - score_min
+                    eligible_scores = flat_scores[eligible_idx]
 
-                    if score_range < 1e-8:
-                        use_selection = False
+                    # Remove zero scores if positive-only selection created them.
+                    if args.adv_positive_only:
+                        nonzero_scores = eligible_scores[eligible_scores > 0.0]
+                    else:
+                        nonzero_scores = eligible_scores
+
+                    if nonzero_scores.numel() < min_keep:
+                        keep_mask = torch.ones_like(combined_score, dtype=torch.float32)
                         score_threshold = None
                     else:
-                        score_threshold = score_min + (1.0 - float(args.adv_keep_frac)) * score_range
-                        use_selection = True
+                        sorted_scores = torch.sort(nonzero_scores).values
+                        
+                        # Calculate the exact index that drops the bottom (1 - keep_frac) of the data
+                        drop_frac = 1.0 - float(args.adv_keep_frac)
+                        target_idx = int(drop_frac * sorted_scores.numel())
+                        target_idx = max(0, min(target_idx, sorted_scores.numel() - 1))
+                        
+                        # This selects a threshold value that actually exists in your data array
+                        score_threshold = sorted_scores[target_idx].item()
 
-            keep_mask = torch.ones_like(combined_score, dtype=torch.float32)
+                        keep_flat = torch.zeros_like(flat_scores, dtype=torch.float32)
+                        keep_condition = flat_scores >= score_threshold
 
-            if use_selection:
-                keep_mask = ((combined_score >= float(score_threshold)) & typical_enough).float()
+                        if args.adv_positive_only:
+                            keep_condition = keep_condition & (flat_scores > 0.0)
 
-                # Safety: enforce minimum amount of data.
-                if int(keep_mask.sum().item()) < min_keep:
-                    flat_score = combined_score.reshape(-1)
-                    top_idx = torch.topk(flat_score, k=min_keep, largest=True).indices
-                    keep_mask = torch.zeros_like(flat_score)
-                    keep_mask[top_idx] = 1.0
-                    keep_mask = keep_mask.reshape(rb.ptr, env.num_envs)
+                        keep_condition = keep_condition & eligible_mask.reshape(-1)
+                        keep_flat[keep_condition] = 1.0
 
-            rb.keep_mask[:rb.ptr] = keep_mask
-            rb.semantic_score[:rb.ptr] = combined_score.float()
+                        if int(keep_flat.sum().item()) < min_keep:
+                            top_idx = torch.topk(eligible_scores, k=min_keep, largest=True).indices
+                            selected_idx = eligible_idx[top_idx]
+                            keep_flat = torch.zeros_like(flat_scores, dtype=torch.float32)
+                            keep_flat[selected_idx] = 1.0
+
+                        keep_mask = keep_flat.reshape_as(combined_score)
+
+            if keep_mask.ndim == 3:
+                rb.keep_mask_agent[:rb.ptr] = keep_mask
+                rb.keep_mask[:rb.ptr] = keep_mask.mean(dim=-1)
+                rb.semantic_score[:rb.ptr] = combined_score.mean(dim=-1).float()
+            else:
+                rb.keep_mask[:rb.ptr] = keep_mask
+                rb.keep_mask_agent[:rb.ptr] = keep_mask.unsqueeze(-1).expand(rb.ptr, env.num_envs, env.n_agents)
+                rb.semantic_score[:rb.ptr] = combined_score.float()
 
             # Keep cluster diagnostics unchanged.
             if args.cluster_enabled:
@@ -1057,7 +1079,7 @@ if __name__ == "__main__":
         # Per-transition weights in [soft_discard_weight, 1.0]
         # shape: (T*E,) for critic, (T*E*N,) for actor
         b_weights_step = rb.keep_mask[:T].reshape(T * E)
-        b_weights_agent = rb.keep_mask[:T].unsqueeze(-1).expand(T, E, N).reshape(T * E * N)
+        b_weights_agent = rb.keep_mask_agent[:T].reshape(T * E * N)
         
         b_keep_step = b_weights_step > 0.5
         b_keep_agent = b_weights_agent > 0.5
@@ -1082,12 +1104,6 @@ if __name__ == "__main__":
             for start in range(0, total_step_samples, step_minibatch_size):
                 idx_step = step_perm[start : start + step_minibatch_size]
                 idx_agent = (idx_step.unsqueeze(1) * N + agent_offsets).reshape(-1)
-                
-                idx_step = idx_step[b_keep_step[idx_step]]
-                idx_agent = idx_agent[b_keep_agent[idx_agent]]
-
-                if idx_step.numel() == 0 or idx_agent.numel() == 0:
-                    continue
 
                 mb_obs = b_obs[idx_agent]
                 mb_actions = b_actions[idx_agent]
@@ -1111,18 +1127,30 @@ if __name__ == "__main__":
                 pg_loss2 = mb_advantages * torch.clamp(ratio, 1 - args.ppo_clip, 1 + args.ppo_clip)
                 pg_loss = -torch.min(pg_loss1, pg_loss2)
 
-                actor_loss = pg_loss.mean()
+                # --- NEW: Hard Discard for Actor Only ---
+                # Convert boolean mask to float (1.0 for keep, 0.0 for discard)
+                mb_keep_agent = b_keep_agent[idx_agent].float()
+                valid_actor_samples = torch.clamp(mb_keep_agent.sum(), min=1.0)
+                
+                # Zero out the policy gradient loss for discarded transitions
+                actor_loss = (pg_loss * mb_keep_agent).sum() / valid_actor_samples
+                
+                # === FIX: Compute entropy over the ENTIRE minibatch ===
+                # Do not mask this! The agent must maintain exploration on all states.
                 entropy_bonus = current_entropy.mean()
 
                 total_actor_loss = actor_loss - args.entropy_coef * entropy_bonus
 
+                # --- NEW: Train Critic on 100% of the Data ---
                 current_values = critic(mb_states)
                 per_step_critic_loss = F.mse_loss(current_values, mb_returns, reduction="none")
-
+                
+                # Standard mean over the entire minibatch (no masking applied)
                 critic_loss = per_step_critic_loss.mean()
 
                 total_loss = total_actor_loss + args.value_coef * critic_loss
 
+                # === FIX: Clear old gradients and backpropagate the total loss ===
                 actor_optimizer.zero_grad()
                 critic_optimizer.zero_grad()
                 total_loss.backward()
@@ -1209,6 +1237,12 @@ if __name__ == "__main__":
                     float(rb.semantic_score[:rb.ptr].max().item()) if rb.ptr > 0 else 0.0,
                     step,
                 )
+                
+            writer.add_scalar("semantic/current_keep_rate", float(rb.keep_mask[:rb.ptr].mean().item()), step)
+            writer.add_scalar("semantic/num_kept_current", float(rb.keep_mask[:rb.ptr].sum().item()), step)
+
+            if score_threshold is not None:
+                writer.add_scalar("semantic/current_score_threshold", float(score_threshold), step)
 
             if args.cluster_enabled:
                 writer.add_scalar("cluster/entropy", float(last_cluster_entropy), step)

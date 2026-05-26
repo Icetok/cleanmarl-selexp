@@ -54,6 +54,7 @@ class VMASWrapper:
             continuous_actions=continuous_actions,
             dict_spaces=False,
             max_steps=self.max_steps,
+            n_agents=n_agents,
             **kwargs,
         )
 
@@ -136,6 +137,15 @@ class VMASWrapper:
 
         r_vec = self._to_np_rew(rew)
         reward_team = self._aggregate_reward(r_vec)
+        reward_agents = self._per_agent_reward(r_vec)
+        
+        if not hasattr(self, "_reward_debug_printed"):
+            self._reward_debug_printed = True
+            print("[reward debug] raw type:", type(rew))
+            print("[reward debug] r_vec shape:", np.asarray(r_vec).shape)
+            print("[reward debug] r_vec min/max:", np.min(r_vec), np.max(r_vec))
+            print("[reward debug] reward_team shape:", reward_team.shape)
+            print("[reward debug] reward_team min/max:", reward_team.min(), reward_team.max())
 
         if self.semantic_enabled:
             s_score = self._compute_semantic_score(obs_raw=obs_raw, reward_scalar=reward_team)
@@ -167,6 +177,7 @@ class VMASWrapper:
         infos["semantic_mode"] = self.semantic_mode
         infos["reward_vec"] = r_vec
         infos["reward_team"] = reward_team
+        infos["reward_agents"] = reward_agents
 
         return obs_out, reward_team.astype(np.float32), terminated, truncated, infos
 
@@ -344,6 +355,30 @@ class VMASWrapper:
             return np.sum(r_np, axis=tuple(range(1, r_np.ndim))).astype(np.float32)
         except Exception:
             return np.full((self.num_envs,), float(np.sum(r_np)), dtype=np.float32)
+
+    def _per_agent_reward(self, r_vec):
+        r_np = np.asarray(r_vec, dtype=np.float32)
+        r_np = np.squeeze(r_np)
+
+        if r_np.ndim == 0:
+            return np.full((self.num_envs, self.n_agents), float(r_np), dtype=np.float32)
+
+        if r_np.ndim == 1:
+            if r_np.shape[0] == self.num_envs:
+                return np.repeat(r_np[:, None], self.n_agents, axis=1).astype(np.float32)
+
+            if r_np.shape[0] == self.n_agents:
+                return np.repeat(r_np[None, :], self.num_envs, axis=0).astype(np.float32)
+
+        if r_np.ndim == 2:
+            if r_np.shape == (self.num_envs, self.n_agents):
+                return r_np.astype(np.float32)
+
+            if r_np.shape == (self.n_agents, self.num_envs):
+                return r_np.T.astype(np.float32)
+
+        reward_team = self._aggregate_reward(r_np)
+        return np.repeat((reward_team / max(1, self.n_agents))[:, None], self.n_agents, axis=1).astype(np.float32)
 
     def _to_np_obs(self, obs):
         if isinstance(obs, list):

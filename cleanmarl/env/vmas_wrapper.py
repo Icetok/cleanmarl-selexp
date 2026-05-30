@@ -25,7 +25,7 @@ class VMASWrapper:
         agent_ids=True,
         device="cpu",
         continuous_actions=False,
-        semantic_enabled=True,
+        semantic_enabled=False,
         semantic_threshold=0.0,
         semantic_mode="interaction",
         interaction_radius=0.5,
@@ -190,9 +190,13 @@ class VMASWrapper:
         if len(indices) == 0:
             return self._last_obs.copy(), {}
 
+        # If all environments hit max_steps simultaneously, reset them all at once!
+        if len(indices) == self.num_envs:
+            return self.reset()
+
+        # For partial resets (if a few agents finish early), fall back to the loop
         for idx in indices:
             idx = int(idx)
-
             try:
                 obs_idx = self.env.reset_at(idx)
             except AttributeError:

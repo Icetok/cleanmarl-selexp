@@ -54,7 +54,7 @@ class Args:
     vmas_covering_range: float = 0.25
     vmas_agents_per_target: int = 2
     vmas_targets_respawn: bool = True
-    vmas_shared_reward: bool = True
+    vmas_shared_reward: bool = False
     vmas_agent_collision_penalty: float = 0.0
 
     # -------------------------
@@ -982,50 +982,44 @@ if __name__ == "__main__":
                 if args.adv_positive_only:
                     eligible_mask = eligible_mask & (adv_score > 0.0)
 
-                eligible_idx = torch.nonzero(eligible_mask.reshape(-1), as_tuple=False).squeeze(-1)
                 flat_scores = combined_score.reshape(-1)
+                eligible_idx = torch.nonzero(eligible_mask.reshape(-1), as_tuple=False).squeeze(-1)
 
                 if eligible_idx.numel() < min_keep:
-                    # Not enough meaningful candidates; do not force a tiny biased update.
                     keep_mask = torch.ones_like(combined_score, dtype=torch.float32)
                     score_threshold = None
                 else:
                     eligible_scores = flat_scores[eligible_idx]
 
-                    # Remove zero scores if positive-only selection created them.
                     if args.adv_positive_only:
-                        nonzero_scores = eligible_scores[eligible_scores > 0.0]
+                        eligible_scores_for_threshold = eligible_scores[eligible_scores > 0.0]
                     else:
-                        nonzero_scores = eligible_scores
+                        eligible_scores_for_threshold = eligible_scores
 
-                    if nonzero_scores.numel() < min_keep:
+                    if eligible_scores_for_threshold.numel() < min_keep:
                         keep_mask = torch.ones_like(combined_score, dtype=torch.float32)
                         score_threshold = None
                     else:
-                        sorted_scores = torch.sort(nonzero_scores).values
-                        
-                        # Calculate the exact index that drops the bottom (1 - keep_frac) of the data
-                        drop_frac = 1.0 - float(args.adv_keep_frac)
-                        target_idx = int(drop_frac * sorted_scores.numel())
-                        target_idx = max(0, min(target_idx, sorted_scores.numel() - 1))
-                        
-                        # This selects a threshold value that actually exists in your data array
-                        score_threshold = sorted_scores[target_idx].item()
+                        # Exact top-k selection.
+                        # This makes adv_keep_frac correspond to the actual fraction kept.
+                        k_keep = int(float(args.adv_keep_frac) * eligible_scores.numel())
+                        k_keep = max(min_keep, k_keep)
+                        k_keep = min(k_keep, eligible_scores.numel())
+
+                        top_local_idx = torch.topk(
+                            eligible_scores,
+                            k=k_keep,
+                            largest=True,
+                            sorted=False,
+                        ).indices
+
+                        selected_idx = eligible_idx[top_local_idx]
 
                         keep_flat = torch.zeros_like(flat_scores, dtype=torch.float32)
-                        keep_condition = flat_scores >= score_threshold
+                        keep_flat[selected_idx] = 1.0
 
-                        if args.adv_positive_only:
-                            keep_condition = keep_condition & (flat_scores > 0.0)
-
-                        keep_condition = keep_condition & eligible_mask.reshape(-1)
-                        keep_flat[keep_condition] = 1.0
-
-                        if int(keep_flat.sum().item()) < min_keep:
-                            top_idx = torch.topk(eligible_scores, k=min_keep, largest=True).indices
-                            selected_idx = eligible_idx[top_idx]
-                            keep_flat = torch.zeros_like(flat_scores, dtype=torch.float32)
-                            keep_flat[selected_idx] = 1.0
+                        # Real existing threshold value among selected scores.
+                        score_threshold = flat_scores[selected_idx].min().item()
 
                         keep_mask = keep_flat.reshape_as(combined_score)
 
@@ -1195,7 +1189,7 @@ if __name__ == "__main__":
                 step,
             )
 
-        if num_episode % args.log_every == 0 and len(completed_ep_returns_raw_team) > 0:
+        if len(completed_ep_returns_raw_team) >= args.log_every:
             writer.add_scalar(
                 "rollout/completed_ep_return_raw_team_mean",
                 float(np.mean(completed_ep_returns_raw_team)),
@@ -1203,15 +1197,15 @@ if __name__ == "__main__":
             )
             writer.add_scalar(
                 "rollout/completed_ep_length_mean",
-                float(np.mean(completed_ep_lengths)) if len(completed_ep_lengths) > 0 else 0.0,
+                float(np.mean(completed_ep_lengths)),
                 step,
             )
             writer.add_scalar("rollout/completed_episodes_total", num_episode, step)
             writer.add_scalar("rollout/step_reward_raw_team_running_mean", float(reward_stats.reward_mean), step)
             writer.add_scalar("rollout/step_reward_raw_team_running_std", float(reward_stats.reward_std), step)
 
-            completed_ep_returns_raw_team = []
-            completed_ep_lengths = []
+            completed_ep_returns_raw_team.clear()
+            completed_ep_lengths.clear()
 
         if args.semantic_enabled and num_episode % args.semantic_log_every == 0:
             writer.add_scalar(

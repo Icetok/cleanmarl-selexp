@@ -333,7 +333,25 @@ class Critic(nn.Module):
         for layer in self.layers:
             x = layer(x)
         return x.squeeze(-1)
+    
+class QCritic(nn.Module):
+    def __init__(self, state_dim, joint_action_dim, hidden_dim, num_layer, activation_name="relu") -> None:
+        super().__init__()
 
+        input_dim = state_dim + joint_action_dim
+
+        layers = [nn.Sequential(nn.Linear(input_dim, hidden_dim), _make_activation(activation_name))]
+        for _ in range(num_layer):
+            layers.append(nn.Sequential(nn.Linear(hidden_dim, hidden_dim), _make_activation(activation_name)))
+        layers.append(nn.Linear(hidden_dim, 1))
+
+        self.layers = nn.ModuleList(layers)
+
+    def forward(self, states, joint_actions):
+        x = torch.cat([states, joint_actions], dim=-1)
+        for layer in self.layers:
+            x = layer(x)
+        return x.squeeze(-1)
 
 def norm_d(grads, d):
     norms = [torch.linalg.vector_norm(g.detach(), ord=d) for g in grads if g is not None]
@@ -700,11 +718,19 @@ if __name__ == "__main__":
         num_layer=args.critic_num_layers,
         activation_name=args.activation,
     ).to(device)
+    
+    qcritic = QCritic(
+        state_dim=env.get_state_size(),
+        joint_action_dim=env.n_agents * env.get_action_size(),
+        hidden_dim=args.critic_hidden_dim,
+        num_layer=args.critic_num_layers,
+        activation_name=args.activation,
+    ).to(device)
 
     Optimizer = getattr(optim, args.optimizer)
     actor_optimizer = Optimizer(actor.parameters(), lr=args.learning_rate_actor, eps=args.adam_eps)
     critic_optimizer = Optimizer(critic.parameters(), lr=args.learning_rate_critic, eps=args.adam_eps)
-
+    qcritic_optimizer = Optimizer(qcritic.parameters(), lr=args.learning_rate_critic, eps=args.adam_eps)
     time_token = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     run_name = f"{args.env_type}__{args.env_name}__{time_token}"
 
@@ -914,29 +940,43 @@ if __name__ == "__main__":
         cf_advantages_unnorm = None
 
         if args.cf_advantage_enabled:
-            agent_rewards = rb.rewards_agents[:rb.ptr]
+            with torch.no_grad():
+                states_cf = rb.states[:rb.ptr]      # (T, E, S)
+                actions_cf = rb.actions[:rb.ptr]    # (T, E, N, A)
 
-            if args.normalize_reward and reward_batch_std_used is not None:
-                agent_rewards = agent_rewards / reward_batch_std_used
+                Tcf, Ecf, Ncf, Acf = actions_cf.shape
 
-            reward_sum = agent_rewards.sum(dim=-1, keepdim=True)
+                # Average action across agents at each timestep/env
+                mean_action = actions_cf.mean(dim=2, keepdim=True)          # (T, E, 1, A)
+                avg_actions_all = mean_action.expand(Tcf, Ecf, Ncf, Acf)   # (T, E, N, A)
 
-            if env.n_agents > 1:
-                other_mean = (reward_sum - agent_rewards) / float(env.n_agents - 1)
-            else:
-                other_mean = torch.zeros_like(agent_rewards)
+                q_avg = qcritic(
+                    states_cf,
+                    avg_actions_all.reshape(Tcf, Ecf, Ncf * Acf),
+                )  # (T, E)
 
-            cf_rewards = agent_rewards - other_mean
+                cf_scores = torch.zeros((Tcf, Ecf, Ncf), dtype=torch.float32, device=device)
 
-            cf_advantages = torch.zeros_like(cf_rewards, device=device)
-            last_cf = torch.zeros((env.num_envs, env.n_agents), dtype=torch.float32, device=device)
+                for agent_i in range(Ncf):
+                    mixed_actions = avg_actions_all.clone()
 
-            for t in reversed(range(rb.ptr)):
-                nextnonterminal = (1.0 - dones[t]).unsqueeze(-1)
-                last_cf = cf_rewards[t] + args.gamma * args.gae_lambda * nextnonterminal * last_cf
-                cf_advantages[t] = last_cf
+                    # Only agent i keeps its real action.
+                    # All other agents use the average action.
+                    mixed_actions[:, :, agent_i, :] = actions_cf[:, :, agent_i, :]
 
-            cf_advantages_unnorm = cf_advantages.clone()
+                    q_i = qcritic(
+                        states_cf,
+                        mixed_actions.reshape(Tcf, Ecf, Ncf * Acf),
+                    )
+
+                    cf_scores[:, :, agent_i] = q_i - q_avg
+
+                cf_advantages_unnorm = cf_scores
+                writer.add_scalar("cf_score/mean", cf_scores.mean().item(), step)
+                writer.add_scalar("cf_score/std", cf_scores.std().item(), step)
+                writer.add_scalar("cf_score/min", cf_scores.min().item(), step)
+                writer.add_scalar("cf_score/max", cf_scores.max().item(), step)
+                writer.add_scalar("cf_score/abs_mean", cf_scores.abs().mean().item(), step)
 
         if args.normalize_advantage:
             adv_mean = advantages.mean()
@@ -952,85 +992,76 @@ if __name__ == "__main__":
         # Semantic selection (advantage mode)
         # -------------------------
         score_threshold = None
-        
+
         if args.semantic_enabled and args.semantic_mode == "advantage":
+
             if args.cf_advantage_enabled and cf_advantages_unnorm is not None:
-                adv_raw = cf_advantages_unnorm[:rb.ptr].detach()  # (T, E, N)
+                cf_raw = cf_advantages_unnorm[:rb.ptr].detach()  # (T, E, N)
+
+                if args.adv_use_abs:
+                    combined_score = cf_raw.abs().max(dim=-1).values
+                elif args.adv_positive_only:
+                    combined_score = torch.clamp(cf_raw, min=0.0).max(dim=-1).values
+                else:
+                    combined_score = cf_raw.max(dim=-1).values
             else:
-                adv_raw = advantages_unnorm[:rb.ptr].detach()     # (T, E)
+                adv_raw = advantages_unnorm[:rb.ptr].detach()
 
-            # 1) Advantage score: TD-error-inspired, but translated to MAPPO advantage.
-            if args.adv_use_abs:
-                adv_score = torch.abs(adv_raw)
-            elif args.adv_positive_only:
-                adv_score = torch.clamp(adv_raw, min=0.0)
+                if args.adv_use_abs:
+                    combined_score = torch.abs(adv_raw)
+                elif args.adv_positive_only:
+                    combined_score = torch.clamp(adv_raw, min=0.0)
+                else:
+                    combined_score = adv_raw
+
+            valid_mask = torch.ones_like(combined_score, dtype=torch.bool)
+
+            flat_scores = combined_score.reshape(-1)
+            flat_valid = valid_mask.reshape(-1)
+
+            if args.adv_use_abs or args.adv_positive_only:
+                eligible_mask = flat_valid & (flat_scores > 0.0)
             else:
-                adv_score = adv_raw
+                eligible_mask = flat_valid & (flat_scores != 0.0)
 
-            combined_score = adv_score
-            eligible_enough = torch.ones_like(adv_score, dtype=torch.bool)
-
-            total_transitions = combined_score.numel()
-            min_keep = max(1, int(float(args.adv_min_keep_frac) * total_transitions))
+            eligible_idx = torch.nonzero(eligible_mask, as_tuple=False).squeeze(-1)
 
             if step_at_rollout_start < args.adv_warmup_steps:
                 keep_mask = torch.ones_like(combined_score, dtype=torch.float32)
                 score_threshold = None
+
+            elif eligible_idx.numel() == 0:
+                keep_mask = torch.ones_like(combined_score, dtype=torch.float32)
+                score_threshold = None
+
             else:
-                eligible_mask = eligible_enough.clone()
+                eligible_scores = flat_scores[eligible_idx]
 
-                if args.adv_positive_only:
-                    eligible_mask = eligible_mask & (adv_score > 0.0)
+                min_keep = max(1, int(float(args.adv_min_keep_frac) * eligible_idx.numel()))
+                k_keep = int(float(args.adv_keep_frac) * eligible_idx.numel())
+                k_keep = max(min_keep, k_keep)
+                k_keep = min(k_keep, eligible_idx.numel())
 
-                flat_scores = combined_score.reshape(-1)
-                eligible_idx = torch.nonzero(eligible_mask.reshape(-1), as_tuple=False).squeeze(-1)
+                top_local_idx = torch.topk(
+                    eligible_scores,
+                    k=k_keep,
+                    largest=True,
+                    sorted=False,
+                ).indices
 
-                if eligible_idx.numel() < min_keep:
-                    keep_mask = torch.ones_like(combined_score, dtype=torch.float32)
-                    score_threshold = None
-                else:
-                    eligible_scores = flat_scores[eligible_idx]
+                selected_idx = eligible_idx[top_local_idx]
 
-                    if args.adv_positive_only:
-                        eligible_scores_for_threshold = eligible_scores[eligible_scores > 0.0]
-                    else:
-                        eligible_scores_for_threshold = eligible_scores
+                keep_flat = torch.zeros_like(flat_scores, dtype=torch.float32)
+                keep_flat[selected_idx] = 1.0
 
-                    if eligible_scores_for_threshold.numel() < min_keep:
-                        keep_mask = torch.ones_like(combined_score, dtype=torch.float32)
-                        score_threshold = None
-                    else:
-                        # Exact top-k selection.
-                        # This makes adv_keep_frac correspond to the actual fraction kept.
-                        k_keep = int(float(args.adv_keep_frac) * eligible_scores.numel())
-                        k_keep = max(min_keep, k_keep)
-                        k_keep = min(k_keep, eligible_scores.numel())
+                score_threshold = flat_scores[selected_idx].min().item()
+                keep_mask = keep_flat.reshape_as(combined_score)
 
-                        top_local_idx = torch.topk(
-                            eligible_scores,
-                            k=k_keep,
-                            largest=True,
-                            sorted=False,
-                        ).indices
-
-                        selected_idx = eligible_idx[top_local_idx]
-
-                        keep_flat = torch.zeros_like(flat_scores, dtype=torch.float32)
-                        keep_flat[selected_idx] = 1.0
-
-                        # Real existing threshold value among selected scores.
-                        score_threshold = flat_scores[selected_idx].min().item()
-
-                        keep_mask = keep_flat.reshape_as(combined_score)
-
-            if keep_mask.ndim == 3:
-                rb.keep_mask_agent[:rb.ptr] = keep_mask
-                rb.keep_mask[:rb.ptr] = keep_mask.mean(dim=-1)
-                rb.semantic_score[:rb.ptr] = combined_score.mean(dim=-1).float()
-            else:
-                rb.keep_mask[:rb.ptr] = keep_mask
-                rb.keep_mask_agent[:rb.ptr] = keep_mask.unsqueeze(-1).expand(rb.ptr, env.num_envs, env.n_agents)
-                rb.semantic_score[:rb.ptr] = combined_score.float()
+            rb.keep_mask[:rb.ptr] = keep_mask
+            rb.keep_mask_agent[:rb.ptr] = keep_mask.unsqueeze(-1).expand(
+                rb.ptr, env.num_envs, env.n_agents
+            )
+            rb.semantic_score[:rb.ptr] = combined_score.float()
 
             # Keep cluster diagnostics unchanged.
             if args.cluster_enabled:
@@ -1066,6 +1097,7 @@ if __name__ == "__main__":
         b_actions = rb.actions[:T].reshape(T * E * N, env.get_action_size())
         b_old_log_probs = rb.log_probs[:T].reshape(T * E * N)
         b_advantages = advantages[:T].unsqueeze(-1).expand(T, E, N).reshape(T * E * N)
+        b_joint_actions = rb.actions[:T].reshape(T * E, env.n_agents * env.get_action_size())
 
         b_states = rb.states[:T].reshape(T * E, env.get_state_size())
         b_returns = returns[:T].reshape(T * E)
@@ -1080,6 +1112,7 @@ if __name__ == "__main__":
 
         actor_losses = []
         critic_losses = []
+        qcritic_losses = []
         entropies_bonuses = []
         kl_divergences = []
         actor_gradients = []
@@ -1142,11 +1175,17 @@ if __name__ == "__main__":
                 # Standard mean over the entire minibatch (no masking applied)
                 critic_loss = per_step_critic_loss.mean()
 
-                total_loss = total_actor_loss + args.value_coef * critic_loss
+                mb_joint_actions = b_joint_actions[idx_step]
+
+                current_q = qcritic(mb_states, mb_joint_actions)
+                qcritic_loss = F.mse_loss(current_q, mb_returns)
+
+                total_loss = total_actor_loss + args.value_coef * critic_loss + args.value_coef * qcritic_loss
 
                 # === FIX: Clear old gradients and backpropagate the total loss ===
                 actor_optimizer.zero_grad()
                 critic_optimizer.zero_grad()
+                qcritic_optimizer.zero_grad()
                 total_loss.backward()
 
                 actor_gradient = norm_d([p.grad for p in actor.parameters()], 2)
@@ -1158,6 +1197,7 @@ if __name__ == "__main__":
 
                 actor_optimizer.step()
                 critic_optimizer.step()
+                qcritic_optimizer.step()
 
                 approx_kl = ((ratio - 1) - log_ratio).mean()
                 clipped_ratio = ((ratio - 1.0).abs() > args.ppo_clip).float().mean()
@@ -1166,6 +1206,7 @@ if __name__ == "__main__":
 
                 actor_losses.append(float(actor_loss.detach().cpu().item()))
                 critic_losses.append(float(critic_loss.detach().cpu().item()))
+                qcritic_losses.append(float(qcritic_loss.detach().cpu().item()))
                 entropies_bonuses.append(float(entropy_bonus.detach().cpu().item()))
                 kl_divergences.append(float(approx_kl.detach().cpu().item()))
                 actor_gradients.append(float(actor_gradient.detach().cpu().item()))
@@ -1174,6 +1215,7 @@ if __name__ == "__main__":
 
         writer.add_scalar("train/critic_loss", np.mean(critic_losses), step)
         writer.add_scalar("train/actor_loss", np.mean(actor_losses), step)
+        writer.add_scalar("train/qcritic_loss", np.mean(qcritic_losses), step)
         writer.add_scalar("train/policy_entropy", np.mean(entropies_bonuses), step)
         writer.add_scalar("train/approx_kl", np.mean(kl_divergences), step)
         writer.add_scalar("train/clipped_ratio_fraction", np.mean(clipped_ratios), step)

@@ -114,6 +114,9 @@ class LBFWrapper(CommonInterface):
         return obs.astype(np.float32, copy=False)
     
     def render(self, mode="rgb_array"):
+        if mode == "rgb_array":
+            return self._render_rgb_array_manual()
+
         try:
             return self.env.render()
         except Exception as e:
@@ -121,6 +124,46 @@ class LBFWrapper(CommonInterface):
                 self._render_warned = True
                 print(f"[lbf_render] render failed: {type(e).__name__}: {e}")
             return None
+        
+    def _render_rgb_array_manual(self, cell_size=40):
+        # Manual top-down RGB renderer for LBF when rgb_array is unsupported.
+        unwrapped = self.env.unwrapped
+
+        rows = int(getattr(unwrapped, "rows", 8))
+        cols = int(getattr(unwrapped, "cols", 8))
+
+        img = np.ones((rows * cell_size, cols * cell_size, 3), dtype=np.uint8) * 255
+
+        # grid lines
+        img[::cell_size, :, :] = 180
+        img[:, ::cell_size, :] = 180
+
+        # draw food
+        for food in getattr(unwrapped, "food", []):
+            y, x = food.position
+            y, x = int(y), int(x)
+            y0, y1 = y * cell_size, (y + 1) * cell_size
+            x0, x1 = x * cell_size, (x + 1) * cell_size
+            img[y0 + 6:y1 - 6, x0 + 6:x1 - 6, :] = np.array([80, 180, 80], dtype=np.uint8)
+
+        # draw agents
+        colours = [
+            [220, 60, 60],
+            [60, 100, 220],
+            [220, 160, 50],
+            [160, 60, 220],
+            [60, 180, 180],
+        ]
+
+        for i, agent in enumerate(getattr(unwrapped, "players", [])):
+            y, x = agent.position
+            y, x = int(y), int(x)
+            y0, y1 = y * cell_size, (y + 1) * cell_size
+            x0, x1 = x * cell_size, (x + 1) * cell_size
+            colour = np.array(colours[i % len(colours)], dtype=np.uint8)
+            img[y0 + 10:y1 - 10, x0 + 10:x1 - 10, :] = colour
+
+        return img
 
     def close(self):
         self.env.close()

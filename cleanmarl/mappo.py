@@ -410,7 +410,7 @@ def _maybe_write_video(frames, out_path: Path, fps: int, fmt: str):
     fmt = fmt.lower().strip()
     try:
         if fmt == "mp4":
-            imageio.mimsave(str(out_path.with_suffix(".mp4")), cleaned, fps=int(fps), macro_block_size=1)
+            imageio.mimsave(str(out_path.with_suffix(".mp4")), cleaned, fps=int(fps), macro_block_size=2)
         else:
             imageio.mimsave(str(out_path.with_suffix(".gif")), cleaned, fps=int(fps))
     except Exception as e:

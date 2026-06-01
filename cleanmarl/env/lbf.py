@@ -134,8 +134,14 @@ class LBFWrapper(CommonInterface):
         rows, cols = env.field.shape
 
         grid_line = 1
-        width = 1 + cols * (cell_size + grid_line)
-        height = 1 + rows * (cell_size + grid_line)
+        width = cols * (cell_size + grid_line)
+        height = rows * (cell_size + grid_line)
+
+        # make MP4/libx264-safe
+        if width % 2 != 0:
+            width += 1
+        if height % 2 != 0:
+            height += 1
 
         img = Image.new("RGB", (width, height), (255, 255, 255))
         draw = ImageDraw.Draw(img)

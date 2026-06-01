@@ -112,6 +112,15 @@ class LBFWrapper(CommonInterface):
             obs = np.concatenate([obs, ids], axis=1)
 
         return obs.astype(np.float32, copy=False)
+    
+    def render(self, mode="rgb_array"):
+        try:
+            return self.env.render()
+        except Exception as e:
+            if not hasattr(self, "_render_warned"):
+                self._render_warned = True
+                print(f"[lbf_render] render failed: {type(e).__name__}: {e}")
+            return None
 
     def close(self):
         self.env.close()

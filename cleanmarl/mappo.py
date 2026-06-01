@@ -389,6 +389,7 @@ def _as_uint8_rgb(frame):
 
 def _maybe_write_video(frames, out_path: Path, fps: int, fmt: str):
     if not frames:
+        print("[warn] no frames collected; skipping video")
         return
     if not _HAS_IMAGEIO:
         print("[warn] imageio unavailable; skipping video. Install with: pip install imageio imageio-ffmpeg")
@@ -399,7 +400,7 @@ def _maybe_write_video(frames, out_path: Path, fps: int, fmt: str):
     cleaned = []
     for frame in frames:
         frame = _as_uint8_rgb(frame)
-        if frame is not None:
+        if frame is not None and frame.ndim >= 2:
             cleaned.append(frame)
 
     if not cleaned:
@@ -483,7 +484,6 @@ if __name__ == "__main__":
             "time_limit": args.lbf_time_limit,
             "reward_aggr": args.lbf_reward_aggr,
             "seed": args.seed,
-            "render_mode": "rgb_array",
         }
 
     env = environment(args.env_type, args.env_name, args.env_family, args.agent_ids, kwargs)

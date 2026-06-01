@@ -1194,6 +1194,7 @@ if __name__ == "__main__":
                 if args.clip_gradients > 0:
                     torch.nn.utils.clip_grad_norm_(actor.parameters(), max_norm=args.clip_gradients)
                     torch.nn.utils.clip_grad_norm_(critic.parameters(), max_norm=args.clip_gradients)
+                    torch.nn.utils.clip_grad_norm_(qcritic.parameters(), max_norm=args.clip_gradients)
 
                 actor_optimizer.step()
                 critic_optimizer.step()

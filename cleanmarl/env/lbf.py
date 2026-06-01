@@ -125,45 +125,93 @@ class LBFWrapper(CommonInterface):
                 print(f"[lbf_render] render failed: {type(e).__name__}: {e}")
             return None
         
-    def _render_rgb_array_manual(self, cell_size=40):
-        # Manual top-down RGB renderer for LBF when rgb_array is unsupported.
-        unwrapped = self.env.unwrapped
+    def _render_rgb_array_manual(self, cell_size=50):
+        import numpy as np
+        from PIL import Image, ImageDraw, ImageFont
+        from importlib import resources
 
-        rows = int(getattr(unwrapped, "rows", 8))
-        cols = int(getattr(unwrapped, "cols", 8))
+        env = self.env.unwrapped
+        rows, cols = env.field.shape
 
-        img = np.ones((rows * cell_size, cols * cell_size, 3), dtype=np.uint8) * 255
+        grid_line = 1
+        width = 1 + cols * (cell_size + grid_line)
+        height = 1 + rows * (cell_size + grid_line)
 
-        # grid lines
-        img[::cell_size, :, :] = 180
-        img[:, ::cell_size, :] = 180
+        img = Image.new("RGB", (width, height), (255, 255, 255))
+        draw = ImageDraw.Draw(img)
 
-        # draw food
-        for food in getattr(unwrapped, "food", []):
-            y, x = food.position
-            y, x = int(y), int(x)
-            y0, y1 = y * cell_size, (y + 1) * cell_size
-            x0, x1 = x * cell_size, (x + 1) * cell_size
-            img[y0 + 6:y1 - 6, x0 + 6:x1 - 6, :] = np.array([80, 180, 80], dtype=np.uint8)
+        # grid
+        for r in range(rows + 1):
+            y = r * (cell_size + grid_line)
+            draw.line([(0, y), (width, y)], fill=(0, 0, 0), width=1)
+
+        for c in range(cols + 1):
+            x = c * (cell_size + grid_line)
+            draw.line([(x, 0), (x, height)], fill=(0, 0, 0), width=1)
+
+        # load real LBF icons
+        try:
+            icon_root = resources.files("lbforaging.foraging.icons")
+            apple = Image.open(icon_root / "apple.png").convert("RGBA")
+            agent_icon = Image.open(icon_root / "agent.png").convert("RGBA")
+        except Exception as e:
+            print(f"[lbf_render] could not load icons, using fallback shapes: {e}")
+            apple = None
+            agent_icon = None
+
+        try:
+            font = ImageFont.truetype("Times New Roman.ttf", 12)
+        except Exception:
+            try:
+                font = ImageFont.truetype("DejaVuSans-Bold.ttf", 12)
+            except Exception:
+                font = ImageFont.load_default()
+
+        def paste_icon(icon, row, col):
+            x = col * (cell_size + grid_line) + 1
+            y = row * (cell_size + grid_line) + 1
+
+            if icon is None:
+                draw.rectangle(
+                    [(x + 10, y + 10), (x + cell_size - 10, y + cell_size - 10)],
+                    fill=(220, 60, 60),
+                )
+                return
+
+            icon_resized = icon.resize((cell_size, cell_size), Image.Resampling.LANCZOS)
+            img.paste(icon_resized, (x, y), icon_resized)
+
+        def draw_badge(row, col, level):
+            radius = cell_size / 5
+            cx = col * (cell_size + grid_line) + 0.75 * (cell_size + grid_line)
+            cy = row * (cell_size + grid_line) + 0.75 * (cell_size + grid_line)
+
+            draw.ellipse(
+                [(cx - radius, cy - radius), (cx + radius, cy + radius)],
+                fill=(255, 255, 255),
+                outline=(0, 0, 0),
+                width=2,
+            )
+
+            text = str(int(level))
+            bbox = draw.textbbox((0, 0), text, font=font)
+            tw = bbox[2] - bbox[0]
+            th = bbox[3] - bbox[1]
+            draw.text((cx - tw / 2, cy - th / 2 - 1), text, fill=(0, 0, 0), font=font)
+
+        # draw food from env.field, not env.food
+        for row, col in zip(*env.field.nonzero()):
+            level = env.field[row, col]
+            paste_icon(apple, row, col)
+            draw_badge(row, col, level)
 
         # draw agents
-        colours = [
-            [220, 60, 60],
-            [60, 100, 220],
-            [220, 160, 50],
-            [160, 60, 220],
-            [60, 180, 180],
-        ]
+        for player in env.players:
+            row, col = player.position
+            paste_icon(agent_icon, row, col)
+            draw_badge(row, col, player.level)
 
-        for i, agent in enumerate(getattr(unwrapped, "players", [])):
-            y, x = agent.position
-            y, x = int(y), int(x)
-            y0, y1 = y * cell_size, (y + 1) * cell_size
-            x0, x1 = x * cell_size, (x + 1) * cell_size
-            colour = np.array(colours[i % len(colours)], dtype=np.uint8)
-            img[y0 + 10:y1 - 10, x0 + 10:x1 - 10, :] = colour
-
-        return img
+        return np.asarray(img, dtype=np.uint8)
 
     def close(self):
         self.env.close()

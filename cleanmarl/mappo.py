@@ -14,6 +14,14 @@ from env.lbf import LBFWrapper
 
 from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
+from pathlib import Path
+
+try:
+    import imageio.v2 as imageio
+    _HAS_IMAGEIO = True
+except Exception:
+    imageio = None
+    _HAS_IMAGEIO = False
 
 
 @dataclass
@@ -69,6 +77,14 @@ class Args:
     adv_positive_only: bool = False
     adv_use_abs: bool = False
     cf_advantage_enabled: bool = False
+    
+    # Eval / video
+    eval_save_video: bool = True
+    eval_video_dir: str = "eval_videos"
+    eval_video_fps: int = 8
+    eval_video_format: str = "mp4"
+    eval_video_max_frames: int = 300
+    eval_num_videos_to_save: int = 3
 
     use_wnb: bool = False
     wnb_project: str = ""
@@ -244,7 +260,7 @@ class Actor(nn.Module):
             action = dist.sample()
 
         return action, dist.log_prob(action), dist.entropy()
-
+    
 
 class Critic(nn.Module):
     def __init__(self, input_dim, hidden_dim, num_layer, activation_name="relu") -> None:
@@ -258,6 +274,24 @@ class Critic(nn.Module):
         self.layers = nn.ModuleList(layers)
 
     def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x.squeeze(-1)
+    
+class QCritic(nn.Module):
+    def __init__(self, state_dim, joint_action_dim, hidden_dim, num_layer, activation_name="relu"):
+        super().__init__()
+        input_dim = state_dim + joint_action_dim
+
+        layers = [nn.Sequential(nn.Linear(input_dim, hidden_dim), _make_activation(activation_name))]
+        for _ in range(num_layer):
+            layers.append(nn.Sequential(nn.Linear(hidden_dim, hidden_dim), _make_activation(activation_name)))
+        layers.append(nn.Linear(hidden_dim, 1))
+
+        self.layers = nn.ModuleList(layers)
+
+    def forward(self, states, joint_actions):
+        x = torch.cat([states, joint_actions], dim=-1)
         for layer in self.layers:
             x = layer(x)
         return x.squeeze(-1)
@@ -301,28 +335,28 @@ def build_selection_mask(
     valid_mask,
     keep_frac,
     min_keep_frac,
+    use_abs=False,
     positive_only=False,
 ):
     flat_scores = scores.reshape(-1)
     flat_valid = valid_mask.reshape(-1)
 
-    eligible_mask = flat_valid.clone()
-    if positive_only:
-        eligible_mask = eligible_mask & (flat_scores > 0.0)
+    if use_abs or positive_only:
+        eligible_mask = flat_valid & (flat_scores > 0.0)
+    else:
+        eligible_mask = flat_valid & (flat_scores != 0.0)
 
     eligible_idx = torch.nonzero(eligible_mask, as_tuple=False).squeeze(-1)
 
-    total_valid = int(flat_valid.sum().item())
-    min_keep = max(1, int(float(min_keep_frac) * total_valid))
-
     keep_flat = torch.zeros_like(flat_scores, dtype=torch.float32)
 
-    if eligible_idx.numel() < min_keep:
+    if eligible_idx.numel() == 0:
         keep_flat[flat_valid] = 1.0
         return keep_flat.reshape_as(scores), None
 
     eligible_scores = flat_scores[eligible_idx]
 
+    min_keep = max(1, int(float(min_keep_frac) * eligible_idx.numel()))
     k_keep = int(float(keep_frac) * eligible_idx.numel())
     k_keep = max(min_keep, k_keep)
     k_keep = min(k_keep, eligible_idx.numel())
@@ -341,6 +375,88 @@ def build_selection_mask(
 
     return keep_flat.reshape_as(scores), threshold
 
+def _as_uint8_rgb(frame):
+    if frame is None:
+        return None
+    f = np.asarray(frame)
+    if f.dtype == np.uint8:
+        return f
+    f = f.astype(np.float32)
+    if f.max() <= 1.5:
+        f = f * 255.0
+    return np.clip(f, 0, 255).astype(np.uint8)
+
+
+def _maybe_write_video(frames, out_path: Path, fps: int, fmt: str):
+    if not frames:
+        return
+    if not _HAS_IMAGEIO:
+        print("[warn] imageio unavailable; skipping video. Install with: pip install imageio imageio-ffmpeg")
+        return
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    cleaned = []
+    for frame in frames:
+        frame = _as_uint8_rgb(frame)
+        if frame is not None:
+            cleaned.append(frame)
+
+    if not cleaned:
+        print("[warn] no valid frames collected; skipping video")
+        return
+
+    fmt = fmt.lower().strip()
+    try:
+        if fmt == "mp4":
+            imageio.mimsave(str(out_path.with_suffix(".mp4")), cleaned, fps=int(fps), macro_block_size=1)
+        else:
+            imageio.mimsave(str(out_path.with_suffix(".gif")), cleaned, fps=int(fps))
+    except Exception as e:
+        print(f"[warn] failed to save video: {type(e).__name__}: {e}")
+
+
+def _record_video_episodes(
+    actor,
+    render_env,
+    device,
+    video_root: Path,
+    num_videos: int,
+    max_frames: int,
+    fps: int,
+    fmt: str,
+):
+    for ep_idx in range(num_videos):
+        obs, _ = render_env.reset(seed=42 + ep_idx)
+        frames = []
+        done = False
+        truncated = False
+
+        while not done and not truncated and len(frames) < max_frames:
+            frame = render_env.render(mode="rgb_array")
+            if frame is not None:
+                frames.append(frame)
+
+            with torch.no_grad():
+                actions, _, _ = actor.act(
+                    torch.from_numpy(obs).float().to(device),
+                    avail_action=torch.from_numpy(render_env.get_avail_actions()).bool().to(device),
+                    deterministic=True,
+                )
+
+            obs, _, done, truncated, _ = render_env.step(actions.cpu().numpy())
+
+        if len(frames) > 0:
+            target_frames = int(3 * fps)
+            if len(frames) < target_frames:
+                frames.extend([frames[-1]] * (target_frames - len(frames)))
+
+        _maybe_write_video(
+            frames,
+            video_root / f"eval_ep_{ep_idx}",
+            fps=fps,
+            fmt=fmt,
+        )
 
 if __name__ == "__main__":
     print("[boot] entering main")
@@ -354,6 +470,8 @@ if __name__ == "__main__":
     device = torch.device(args.device)
 
     kwargs = {}
+    render_kwargs = {}
+
     if args.env_type == "lbf":
         kwargs = {
             "time_limit": args.lbf_time_limit,
@@ -361,8 +479,21 @@ if __name__ == "__main__":
             "seed": args.seed,
         }
 
+        render_kwargs = {
+            "time_limit": args.lbf_time_limit,
+            "reward_aggr": args.lbf_reward_aggr,
+            "seed": args.seed,
+            "render_mode": "rgb_array",
+        }
+
     env = environment(args.env_type, args.env_name, args.env_family, args.agent_ids, kwargs)
     eval_env = environment(args.env_type, args.env_name, args.env_family, args.agent_ids, kwargs)
+
+    render_env = (
+        environment(args.env_type, args.env_name, args.env_family, args.agent_ids, render_kwargs)
+        if args.eval_save_video
+        else None
+    )
 
     print(
         "[sanity] n_agents:",
@@ -389,15 +520,25 @@ if __name__ == "__main__":
         num_layer=args.critic_num_layers,
         activation_name=args.activation,
     ).to(device)
+    
+    qcritic = QCritic(
+        state_dim=env.get_state_size(),
+        joint_action_dim=env.n_agents * env.get_action_size(),
+        hidden_dim=args.critic_hidden_dim,
+        num_layer=args.critic_num_layers,
+        activation_name=args.activation,
+    ).to(device)
 
     Optimizer = getattr(optim, args.optimizer)
 
     if args.optimizer.lower() == "adam":
         actor_optimizer = Optimizer(actor.parameters(), lr=args.learning_rate_actor, eps=args.adam_eps)
         critic_optimizer = Optimizer(critic.parameters(), lr=args.learning_rate_critic, eps=args.adam_eps)
+        qcritic_optimizer = Optimizer(qcritic.parameters(), lr=args.learning_rate_critic, eps=args.adam_eps)
     else:
         actor_optimizer = Optimizer(actor.parameters(), lr=args.learning_rate_actor)
         critic_optimizer = Optimizer(critic.parameters(), lr=args.learning_rate_critic)
+        qcritic_optimizer = Optimizer(qcritic.parameters(), lr=args.learning_rate_critic)
 
     time_token = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     run_name = f"{args.env_type}__{args.env_name}__{time_token}"
@@ -596,41 +737,47 @@ if __name__ == "__main__":
         cf_advantages_unnorm = None
 
         if args.cf_advantage_enabled:
-            reward_sum = b_reward_agents.sum(dim=-1, keepdim=True)
+            with torch.no_grad():
+                actions_onehot = F.one_hot(b_actions, num_classes=env.get_action_size()).float()
+                # (B, T, N, A)
 
-            if env.n_agents > 1:
-                other_mean = (reward_sum - b_reward_agents) / float(env.n_agents - 1)
-            else:
-                other_mean = torch.zeros_like(b_reward_agents)
+                Bcf, Tcf, Ncf, Acf = actions_onehot.shape
 
-            cf_rewards = b_reward_agents - other_mean
+                mean_action = actions_onehot.mean(dim=2, keepdim=True)
+                avg_actions_all = mean_action.expand(Bcf, Tcf, Ncf, Acf)
 
-            cf_advantages = torch.zeros_like(cf_rewards, device=device)
-            last_cf = torch.zeros((B, N), dtype=torch.float32, device=device)
+                q_avg = qcritic(
+                    b_states,
+                    avg_actions_all.reshape(Bcf, Tcf, Ncf * Acf),
+                )
 
-            for t in reversed(range(T)):
-                active = b_mask[:, t].float().unsqueeze(-1)
-                last_cf = cf_rewards[:, t] + args.gamma * args.td_lambda * active * last_cf
-                cf_advantages[:, t] = last_cf * active
+                cf_scores = torch.zeros((Bcf, Tcf, Ncf), dtype=torch.float32, device=device)
 
-            cf_advantages_unnorm = cf_advantages.clone()
+                for agent_i in range(Ncf):
+                    mixed_actions = avg_actions_all.clone()
+                    mixed_actions[:, :, agent_i, :] = actions_onehot[:, :, agent_i, :]
+
+                    q_i = qcritic(
+                        b_states,
+                        mixed_actions.reshape(Bcf, Tcf, Ncf * Acf),
+                    )
+
+                    cf_scores[:, :, agent_i] = q_i - q_avg
+
+                cf_advantages_unnorm = cf_scores
+
+                valid_cf_mask = b_mask.unsqueeze(-1).expand(Bcf, Tcf, Ncf)
+                writer.add_scalar("cf_score/mean", cf_scores[valid_cf_mask].mean().item(), step)
+                writer.add_scalar("cf_score/std", cf_scores[valid_cf_mask].std().item(), step)
+                writer.add_scalar("cf_score/min", cf_scores[valid_cf_mask].min().item(), step)
+                writer.add_scalar("cf_score/max", cf_scores[valid_cf_mask].max().item(), step)
+                writer.add_scalar("cf_score/abs_mean", cf_scores[valid_cf_mask].abs().mean().item(), step)
 
         if args.normalize_advantage:
             valid_adv = advantages[b_mask]
             adv_mean = valid_adv.mean()
             adv_std = torch.clamp(valid_adv.std(), min=1e-6)
             advantages = (advantages - adv_mean) / adv_std
-            
-        cf_advantages_norm = None
-
-        if args.cf_advantage_enabled and cf_advantages_unnorm is not None:
-            valid_cf_mask = b_mask.unsqueeze(-1).expand(B, T, N)
-            valid_cf = cf_advantages_unnorm[valid_cf_mask]
-
-            cf_mean = valid_cf.mean()
-            cf_std = torch.clamp(valid_cf.std(), min=1e-6)
-
-            cf_advantages_norm = (cf_advantages_unnorm - cf_mean) / cf_std
 
         if args.normalize_return:
             valid_ret = return_lambda[b_mask]
@@ -647,39 +794,54 @@ if __name__ == "__main__":
         score_threshold = None
 
         if args.semantic_enabled and args.semantic_mode == "advantage":
-            if args.cf_advantage_enabled and cf_advantages_unnorm is not None:
-                score_raw = cf_advantages_unnorm.detach()
-                valid_score_mask = b_mask.unsqueeze(-1).expand(B, T, N)
-            else:
-                score_raw = advantages_unnorm.detach()
-                valid_score_mask = b_mask
 
-            if args.adv_use_abs:
-                score = torch.abs(score_raw)
-            elif args.adv_positive_only:
-                score = torch.clamp(score_raw, min=0.0)
+            if args.cf_advantage_enabled and cf_advantages_unnorm is not None:
+                cf_raw = cf_advantages_unnorm.detach()  # (B, T, N)
+
+                # Convert per-agent CF scores into one transition-level score.
+                # This matches mappo_continuous: select the whole transition based on
+                # the strongest agent contribution.
+                if args.adv_use_abs:
+                    score = cf_raw.abs().max(dim=-1).values       # (B, T)
+                elif args.adv_positive_only:
+                    score = torch.clamp(cf_raw, min=0.0).max(dim=-1).values
+                else:
+                    score = cf_raw.max(dim=-1).values
+
+                valid_score_mask = b_mask  # (B, T)
+
             else:
-                score = score_raw
+                adv_raw = advantages_unnorm.detach()  # (B, T)
+
+                if args.adv_use_abs:
+                    score = torch.abs(adv_raw)
+                elif args.adv_positive_only:
+                    score = torch.clamp(adv_raw, min=0.0)
+                else:
+                    score = adv_raw
+
+                valid_score_mask = b_mask  # (B, T)
 
             if step_at_rollout_start < args.adv_warmup_steps:
-                pass
+                # During warmup, keep everything.
+                keep_mask_step = torch.ones((B, T), dtype=torch.float32, device=device)
+                keep_mask_agent = keep_mask_step.unsqueeze(-1).expand(B, T, N)
+                semantic_score = score.float()
+
             else:
                 selected, score_threshold = build_selection_mask(
                     scores=score,
                     valid_mask=valid_score_mask,
                     keep_frac=args.adv_keep_frac,
                     min_keep_frac=args.adv_min_keep_frac,
+                    use_abs=args.adv_use_abs,
                     positive_only=args.adv_positive_only,
                 )
 
-                if selected.ndim == 3:
-                    keep_mask_agent = selected.float()
-                    keep_mask_step = keep_mask_agent.mean(dim=-1)
-                    semantic_score = score.mean(dim=-1)
-                else:
-                    keep_mask_step = selected.float()
-                    keep_mask_agent = keep_mask_step.unsqueeze(-1).expand(B, T, N)
-                    semantic_score = score.float()
+                # selected is now always step-level: (B, T)
+                keep_mask_step = selected.float()
+                keep_mask_agent = keep_mask_step.unsqueeze(-1).expand(B, T, N)
+                semantic_score = score.float()
 
         semantic_total += int(b_mask.sum().item())
         semantic_kept += int(((keep_mask_step > 0.5) & b_mask).sum().item())
@@ -689,6 +851,7 @@ if __name__ == "__main__":
         # -------------------------
         actor_losses = []
         critic_losses = []
+        qcritic_losses = []
         entropies_bonuses = []
         kl_divergences = []
         actor_gradients = []
@@ -708,11 +871,6 @@ if __name__ == "__main__":
             ratio = torch.exp(log_ratio)
 
             adv_agent = advantages.unsqueeze(-1).expand(B, T, N)
-            
-            if args.cf_advantage_enabled and cf_advantages_norm is not None:
-                adv_agent = cf_advantages_norm
-            else:
-                adv_agent = advantages.unsqueeze(-1).expand(B, T, N)
 
             pg_loss1 = adv_agent * ratio
             pg_loss2 = adv_agent * torch.clamp(
@@ -740,11 +898,22 @@ if __name__ == "__main__":
             )
 
             critic_loss = critic_loss_per_step[b_mask].mean()
+            
+            joint_actions_onehot = F.one_hot(b_actions, num_classes=env.get_action_size()).float()
+            joint_actions_onehot = joint_actions_onehot.reshape(B, T, N * env.get_action_size())
 
-            total_loss = total_actor_loss + args.value_coef * critic_loss
+            current_q = qcritic(b_states, joint_actions_onehot)
+            qcritic_loss_per_step = F.mse_loss(current_q, return_lambda, reduction="none")
+            qcritic_loss = qcritic_loss_per_step[b_mask].mean()
+
+            if args.cf_advantage_enabled or args.semantic_enabled:
+                total_loss = total_actor_loss + args.value_coef * critic_loss + args.value_coef * qcritic_loss
+            else:
+                total_loss = total_actor_loss + args.value_coef * critic_loss
 
             actor_optimizer.zero_grad()
             critic_optimizer.zero_grad()
+            qcritic_optimizer.zero_grad()
 
             total_loss.backward()
 
@@ -754,9 +923,11 @@ if __name__ == "__main__":
             if args.clip_gradients > 0:
                 torch.nn.utils.clip_grad_norm_(actor.parameters(), max_norm=args.clip_gradients)
                 torch.nn.utils.clip_grad_norm_(critic.parameters(), max_norm=args.clip_gradients)
+                torch.nn.utils.clip_grad_norm_(qcritic.parameters(), max_norm=args.clip_gradients)
 
             actor_optimizer.step()
             critic_optimizer.step()
+            qcritic_optimizer.step()
 
             approx_kl = ((ratio - 1.0) - log_ratio)[valid_agent_mask].mean()
             clipped_ratio = ((ratio - 1.0).abs() > args.ppo_clip)[valid_agent_mask].float().mean()
@@ -765,6 +936,7 @@ if __name__ == "__main__":
 
             actor_losses.append(float(actor_loss.detach().cpu().item()))
             critic_losses.append(float(critic_loss.detach().cpu().item()))
+            qcritic_losses.append(float(qcritic_loss.detach().cpu().item()))
             entropies_bonuses.append(float(entropy_bonus.detach().cpu().item()))
             kl_divergences.append(float(approx_kl.detach().cpu().item()))
             actor_gradients.append(float(actor_gradient.detach().cpu().item()))
@@ -773,6 +945,7 @@ if __name__ == "__main__":
 
         writer.add_scalar("train/critic_loss", float(np.mean(critic_losses)), step)
         writer.add_scalar("train/actor_loss", float(np.mean(actor_losses)), step)
+        writer.add_scalar("train/qcritic_loss", float(np.mean(qcritic_losses)), step)
         writer.add_scalar("train/entropy", float(np.mean(entropies_bonuses)), step)
         writer.add_scalar("train/kl_divergence", float(np.mean(kl_divergences)), step)
         writer.add_scalar("train/clipped_ratios", float(np.mean(clipped_ratios)), step)
@@ -843,12 +1016,27 @@ if __name__ == "__main__":
                     float(np.mean([info["battle_won"] for info in eval_ep_stats])),
                     step,
                 )
+            
+            if args.eval_save_video and render_env is not None:
+                video_root = Path(args.eval_video_dir) / run_name / f"step_{step}"
+                _record_video_episodes(
+                    actor=actor,
+                    render_env=render_env,
+                    device=device,
+                    video_root=video_root,
+                    num_videos=args.eval_num_videos_to_save,
+                    max_frames=args.eval_video_max_frames,
+                    fps=args.eval_video_fps,
+                    fmt=args.eval_video_format,
+                )
 
     writer.close()
 
     if args.use_wnb:
         import wandb
         wandb.finish()
-
+        
     env.close()
     eval_env.close()
+    if render_env is not None:
+        render_env.close()

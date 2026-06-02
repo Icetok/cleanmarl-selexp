@@ -143,6 +143,8 @@ class Args:
     adv_positive_only: bool = False
     adv_use_abs: bool = False
     
+    soft_discard_weight: float = 0.5
+    
     cf_advantage_enabled: bool = False
 
     # clustering
@@ -1051,7 +1053,8 @@ if __name__ == "__main__":
 
                 selected_idx = eligible_idx[top_local_idx]
 
-                keep_flat = torch.zeros_like(flat_scores, dtype=torch.float32)
+                keep_flat = torch.full_like(flat_scores, float(args.soft_discard_weight))
+                keep_flat[~flat_valid] = 0.0
                 keep_flat[selected_idx] = 1.0
 
                 score_threshold = flat_scores[selected_idx].min().item()
@@ -1156,11 +1159,11 @@ if __name__ == "__main__":
 
                 # --- NEW: Hard Discard for Actor Only ---
                 # Convert boolean mask to float (1.0 for keep, 0.0 for discard)
-                mb_keep_agent = b_keep_agent[idx_agent].float()
-                valid_actor_samples = torch.clamp(mb_keep_agent.sum(), min=1.0)
+                mb_weights = b_weights_agent[idx_agent]
+                valid_actor_samples = torch.clamp(mb_weights.sum(), min=1.0)
                 
                 # Zero out the policy gradient loss for discarded transitions
-                actor_loss = (pg_loss * mb_keep_agent).sum() / valid_actor_samples
+                actor_loss = (pg_loss * mb_weights).sum() / valid_actor_samples
                 
                 # === FIX: Compute entropy over the ENTIRE minibatch ===
                 # Do not mask this! The agent must maintain exploration on all states.

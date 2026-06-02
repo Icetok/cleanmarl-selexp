@@ -78,6 +78,8 @@ class Args:
     adv_use_abs: bool = False
     cf_advantage_enabled: bool = False
     
+    soft_discard_weight: float = 0.5
+    
     # Eval / video
     eval_save_video: bool = True
     eval_video_dir: str = "eval_videos"
@@ -337,6 +339,7 @@ def build_selection_mask(
     min_keep_frac,
     use_abs=False,
     positive_only=False,
+    soft_discard_weight=0.0,
 ):
     flat_scores = scores.reshape(-1)
     flat_valid = valid_mask.reshape(-1)
@@ -348,7 +351,8 @@ def build_selection_mask(
 
     eligible_idx = torch.nonzero(eligible_mask, as_tuple=False).squeeze(-1)
 
-    keep_flat = torch.zeros_like(flat_scores, dtype=torch.float32)
+    keep_flat = torch.full_like(flat_scores, float(soft_discard_weight))
+    keep_flat[~flat_valid] = 0.0
 
     if eligible_idx.numel() == 0:
         keep_flat[flat_valid] = 1.0
@@ -836,6 +840,7 @@ if __name__ == "__main__":
                     min_keep_frac=args.adv_min_keep_frac,
                     use_abs=args.adv_use_abs,
                     positive_only=args.adv_positive_only,
+                    soft_discard_weight=args.soft_discard_weight,
                 )
 
                 # selected is now always step-level: (B, T)
@@ -882,10 +887,10 @@ if __name__ == "__main__":
             pg_loss = -torch.min(pg_loss1, pg_loss2)
 
             valid_agent_mask = b_mask.unsqueeze(-1).expand(B, T, N)
-            actor_weight_mask = valid_agent_mask & (keep_mask_agent > 0.5)
+            actor_weights = keep_mask_agent * valid_agent_mask.float()
 
-            valid_actor_samples = torch.clamp(actor_weight_mask.float().sum(), min=1.0)
-            actor_loss = (pg_loss * actor_weight_mask.float()).sum() / valid_actor_samples
+            valid_actor_samples = torch.clamp(actor_weights.sum(), min=1.0)
+            actor_loss = (pg_loss * actor_weights).sum() / valid_actor_samples
 
             entropy_bonus = current_dist.entropy()[valid_agent_mask].mean()
             total_actor_loss = actor_loss - args.entropy_coef * entropy_bonus

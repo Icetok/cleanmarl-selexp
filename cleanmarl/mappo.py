@@ -80,6 +80,9 @@ class Args:
     
     soft_discard_weight: float = 0.5
     
+    random_keep_frac: float = 0.1
+    cf_td_weight: float = 0.3
+    
     # Eval / video
     eval_save_video: bool = True
     eval_video_dir: str = "eval_videos"
@@ -339,7 +342,8 @@ def build_selection_mask(
     min_keep_frac,
     use_abs=False,
     positive_only=False,
-    soft_discard_weight=0.0,
+    soft_discard_weight=0.5,
+    random_keep_frac=0.0,
 ):
     flat_scores = scores.reshape(-1)
     flat_valid = valid_mask.reshape(-1)
@@ -374,6 +378,16 @@ def build_selection_mask(
 
     selected_idx = eligible_idx[top_local_idx]
     keep_flat[selected_idx] = 1.0
+
+    # Random coverage: keep some valid samples regardless of score
+    valid_idx = torch.nonzero(flat_valid, as_tuple=False).squeeze(-1)
+    random_keep = int(float(random_keep_frac) * valid_idx.numel())
+
+    if random_keep > 0:
+        rand_idx = valid_idx[
+            torch.randperm(valid_idx.numel(), device=flat_scores.device)[:random_keep]
+        ]
+        keep_flat[rand_idx] = 1.0
 
     threshold = flat_scores[selected_idx].min().item()
 
@@ -711,6 +725,7 @@ if __name__ == "__main__":
         # -------------------------
         return_lambda = torch.zeros((B, T), dtype=torch.float32, device=device)
         advantages = torch.zeros((B, T), dtype=torch.float32, device=device)
+        td_errors = torch.zeros((B, T), dtype=torch.float32, device=device)
 
         with torch.no_grad():
             values = critic(b_states)
@@ -724,7 +739,8 @@ if __name__ == "__main__":
                         next_value = torch.tensor(0.0, device=device)
                     else:
                         next_value = values[ep_idx, t + 1]
-
+                        
+                    td_errors[ep_idx, t] = b_reward[ep_idx, t] + args.gamma * next_value - values[ep_idx, t]
                     last_return = b_reward[ep_idx, t] + args.gamma * (
                         args.td_lambda * last_return
                         + (1.0 - args.td_lambda) * next_value
@@ -747,26 +763,26 @@ if __name__ == "__main__":
 
                 Bcf, Tcf, Ncf, Acf = actions_onehot.shape
 
-                mean_action = actions_onehot.mean(dim=2, keepdim=True)
-                avg_actions_all = mean_action.expand(Bcf, Tcf, Ncf, Acf)
-
-                q_avg = qcritic(
+                q_actual = qcritic(
                     b_states,
-                    avg_actions_all.reshape(Bcf, Tcf, Ncf * Acf),
+                    actions_onehot.reshape(Bcf, Tcf, Ncf * Acf),
                 )
 
                 cf_scores = torch.zeros((Bcf, Tcf, Ncf), dtype=torch.float32, device=device)
 
-                for agent_i in range(Ncf):
-                    mixed_actions = avg_actions_all.clone()
-                    mixed_actions[:, :, agent_i, :] = actions_onehot[:, :, agent_i, :]
+                # No-op counterfactual: remove one agent's action by replacing it with zero-vector
+                noop_action = torch.zeros_like(actions_onehot[:, :, 0, :])
 
-                    q_i = qcritic(
+                for agent_i in range(Ncf):
+                    cf_actions = actions_onehot.clone()
+                    cf_actions[:, :, agent_i, :] = noop_action
+
+                    q_without_i = qcritic(
                         b_states,
-                        mixed_actions.reshape(Bcf, Tcf, Ncf * Acf),
+                        cf_actions.reshape(Bcf, Tcf, Ncf * Acf),
                     )
 
-                    cf_scores[:, :, agent_i] = q_i - q_avg
+                    cf_scores[:, :, agent_i] = q_actual - q_without_i
 
                 cf_advantages_unnorm = cf_scores
 
@@ -802,17 +818,18 @@ if __name__ == "__main__":
             if args.cf_advantage_enabled and cf_advantages_unnorm is not None:
                 cf_raw = cf_advantages_unnorm.detach()  # (B, T, N)
 
-                # Convert per-agent CF scores into one transition-level score.
-                # This matches mappo_continuous: select the whole transition based on
-                # the strongest agent contribution.
-                if args.adv_use_abs:
-                    score = cf_raw.abs().max(dim=-1).values       # (B, T)
-                elif args.adv_positive_only:
-                    score = torch.clamp(cf_raw, min=0.0).max(dim=-1).values
-                else:
-                    score = cf_raw.max(dim=-1).values
+                cf_score = cf_raw.abs().max(dim=-1).values
+                td_score = td_errors.detach().abs()
 
-                valid_score_mask = b_mask  # (B, T)
+                valid_cf = cf_score[b_mask]
+                valid_td = td_score[b_mask]
+
+                cf_score = cf_score / torch.clamp(valid_cf.mean(), min=1e-6)
+                td_score = td_score / torch.clamp(valid_td.mean(), min=1e-6)
+
+                score = (1.0 - args.cf_td_weight) * cf_score + args.cf_td_weight * td_score
+
+                valid_score_mask = b_mask
 
             else:
                 adv_raw = advantages_unnorm.detach()  # (B, T)
@@ -838,9 +855,10 @@ if __name__ == "__main__":
                     valid_mask=valid_score_mask,
                     keep_frac=args.adv_keep_frac,
                     min_keep_frac=args.adv_min_keep_frac,
-                    use_abs=args.adv_use_abs,
+                    use_abs=True if args.cf_advantage_enabled else args.adv_use_abs,
                     positive_only=args.adv_positive_only,
                     soft_discard_weight=args.soft_discard_weight,
+                    random_keep_frac=args.random_keep_frac,
                 )
 
                 # selected is now always step-level: (B, T)
@@ -973,6 +991,11 @@ if __name__ == "__main__":
             writer.add_scalar("semantic/adv_keep_frac_target", float(args.adv_keep_frac), step)
             writer.add_scalar("semantic/adv_score_mean", float(semantic_score[b_mask].mean().item()), step)
             writer.add_scalar("semantic/adv_score_max", float(semantic_score[b_mask].max().item()), step)
+            if args.cf_advantage_enabled and cf_advantages_unnorm is not None:
+                writer.add_scalar("semantic/cf_score_norm_mean", float(cf_score[b_mask].mean().item()), step)
+                writer.add_scalar("semantic/td_score_norm_mean", float(td_score[b_mask].mean().item()), step)
+                writer.add_scalar("semantic/combined_score_mean", float(score[b_mask].mean().item()), step)
+                writer.add_scalar("semantic/combined_score_max", float(score[b_mask].max().item()), step)
 
             if score_threshold is not None:
                 writer.add_scalar("semantic/current_score_threshold", float(score_threshold), step)

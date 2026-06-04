@@ -1008,7 +1008,7 @@ if __name__ == "__main__":
                 cf_score = cf_score / torch.clamp(cf_score.mean(), min=1e-6)
                 td_score = td_score / torch.clamp(td_score.mean(), min=1e-6)
 
-                combined_score = 0.7 * cf_score + 0.3 * td_score
+                combined_score = 0.7 * cf_raw.abs().max(dim=-1).values + 0.3 * td_errors[:rb.ptr].abs()
             else:
                 adv_raw = advantages_unnorm[:rb.ptr].detach()
 

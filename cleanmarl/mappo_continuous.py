@@ -144,6 +144,7 @@ class Args:
     adv_use_abs: bool = False
     
     soft_discard_weight: float = 0.5
+    random_keep_frac: float = 0.1
     
     cf_advantage_enabled: bool = False
 
@@ -952,26 +953,25 @@ if __name__ == "__main__":
                 mean_action = actions_cf.mean(dim=2, keepdim=True)          # (T, E, 1, A)
                 avg_actions_all = mean_action.expand(Tcf, Ecf, Ncf, Acf)   # (T, E, N, A)
 
-                q_avg = qcritic(
+                q_actual = qcritic(
                     states_cf,
-                    avg_actions_all.reshape(Tcf, Ecf, Ncf * Acf),
-                )  # (T, E)
+                    actions_cf.reshape(Tcf, Ecf, Ncf * Acf),
+                )
 
                 cf_scores = torch.zeros((Tcf, Ecf, Ncf), dtype=torch.float32, device=device)
 
+                noop_action = torch.zeros_like(actions_cf[:, :, 0, :])  # no force/action
+
                 for agent_i in range(Ncf):
-                    mixed_actions = avg_actions_all.clone()
+                    cf_actions = actions_cf.clone()
+                    cf_actions[:, :, agent_i, :] = noop_action
 
-                    # Only agent i keeps its real action.
-                    # All other agents use the average action.
-                    mixed_actions[:, :, agent_i, :] = actions_cf[:, :, agent_i, :]
-
-                    q_i = qcritic(
+                    q_without_i = qcritic(
                         states_cf,
-                        mixed_actions.reshape(Tcf, Ecf, Ncf * Acf),
+                        cf_actions.reshape(Tcf, Ecf, Ncf * Acf),
                     )
 
-                    cf_scores[:, :, agent_i] = q_i - q_avg
+                    cf_scores[:, :, agent_i] = q_actual - q_without_i
 
                 cf_advantages_unnorm = cf_scores
                 writer.add_scalar("cf_score/mean", cf_scores.mean().item(), step)
@@ -994,18 +994,21 @@ if __name__ == "__main__":
         # Semantic selection (advantage mode)
         # -------------------------
         score_threshold = None
-
+        current_soft_discard_weight = 1.0
+        
         if args.semantic_enabled and args.semantic_mode == "advantage":
 
             if args.cf_advantage_enabled and cf_advantages_unnorm is not None:
                 cf_raw = cf_advantages_unnorm[:rb.ptr].detach()  # (T, E, N)
 
-                if args.adv_use_abs:
-                    combined_score = cf_raw.abs().max(dim=-1).values
-                elif args.adv_positive_only:
-                    combined_score = torch.clamp(cf_raw, min=0.0).max(dim=-1).values
-                else:
-                    combined_score = cf_raw.max(dim=-1).values
+                cf_score = cf_raw.abs().max(dim=-1).values
+
+                td_score = td_errors[:rb.ptr].detach().abs()
+
+                cf_score = cf_score / torch.clamp(cf_score.mean(), min=1e-6)
+                td_score = td_score / torch.clamp(td_score.mean(), min=1e-6)
+
+                combined_score = 0.7 * cf_score + 0.3 * td_score
             else:
                 adv_raw = advantages_unnorm[:rb.ptr].detach()
 
@@ -1053,9 +1056,21 @@ if __name__ == "__main__":
 
                 selected_idx = eligible_idx[top_local_idx]
 
-                keep_flat = torch.full_like(flat_scores, float(args.soft_discard_weight))
+                current_soft_discard_weight = float(args.soft_discard_weight)
+
+                keep_flat = torch.full_like(flat_scores, current_soft_discard_weight)
                 keep_flat[~flat_valid] = 0.0
                 keep_flat[selected_idx] = 1.0
+                
+                valid_idx = torch.nonzero(flat_valid, as_tuple=False).squeeze(-1)
+
+                random_keep = int(float(args.random_keep_frac) * valid_idx.numel())
+
+                if random_keep > 0:
+                    rand_idx = valid_idx[
+                        torch.randperm(valid_idx.numel(), device=device)[:random_keep]
+                    ]
+                    keep_flat[rand_idx] = 1.0
 
                 score_threshold = flat_scores[selected_idx].min().item()
                 keep_mask = keep_flat.reshape_as(combined_score)
@@ -1280,6 +1295,12 @@ if __name__ == "__main__":
                 
             writer.add_scalar("semantic/current_keep_rate", float(rb.keep_mask[:rb.ptr].mean().item()), step)
             writer.add_scalar("semantic/num_kept_current", float(rb.keep_mask[:rb.ptr].sum().item()), step)
+            
+            writer.add_scalar(
+                "semantic/current_soft_discard_weight",
+                float(current_soft_discard_weight),
+                step,
+            )
 
             if score_threshold is not None:
                 writer.add_scalar("semantic/current_score_threshold", float(score_threshold), step)

@@ -999,16 +999,15 @@ if __name__ == "__main__":
         if args.semantic_enabled and args.semantic_mode == "advantage":
 
             if args.cf_advantage_enabled and cf_advantages_unnorm is not None:
-                cf_raw = cf_advantages_unnorm[:rb.ptr].detach()  # (T, E, N)
+                cf_raw = cf_advantages_unnorm[:rb.ptr].detach()
 
                 cf_score = cf_raw.abs().max(dim=-1).values
-
                 td_score = td_errors[:rb.ptr].detach().abs()
 
                 cf_score = cf_score / torch.clamp(cf_score.mean(), min=1e-6)
                 td_score = td_score / torch.clamp(td_score.mean(), min=1e-6)
 
-                combined_score = 0.7 * cf_raw.abs().max(dim=-1).values + 0.3 * td_errors[:rb.ptr].abs()
+                combined_score = 0.7 * cf_score + 0.3 * td_score
             else:
                 adv_raw = advantages_unnorm[:rb.ptr].detach()
 
@@ -1304,6 +1303,11 @@ if __name__ == "__main__":
 
             if score_threshold is not None:
                 writer.add_scalar("semantic/current_score_threshold", float(score_threshold), step)
+                
+            writer.add_scalar("semantic/cf_score_norm_mean", cf_score.mean().item(), step)
+            writer.add_scalar("semantic/td_score_norm_mean", td_score.mean().item(), step)
+            writer.add_scalar("semantic/combined_score_mean", combined_score.mean().item(), step)
+            writer.add_scalar("semantic/combined_score_max", combined_score.max().item(), step)
 
             if args.cluster_enabled:
                 writer.add_scalar("cluster/entropy", float(last_cluster_entropy), step)

@@ -602,6 +602,9 @@ if __name__ == "__main__":
     semantic_total = 0
     semantic_kept = 0
 
+    semantic_total_steps = 0
+    semantic_selected_steps = 0
+
     while step < args.total_timesteps:
         step_at_rollout_start = step
 
@@ -866,8 +869,26 @@ if __name__ == "__main__":
                 keep_mask_agent = keep_mask_step.unsqueeze(-1).expand(B, T, N)
                 semantic_score = score.float()
 
-        semantic_total += int(b_mask.sum().item())
-        semantic_kept += int(((keep_mask_step > 0.5) & b_mask).sum().item())
+        semantic_total_steps += int(b_mask.sum().item())
+
+        current_weights = keep_mask_step[b_mask]
+
+        current_selected_mask = current_weights == 1.0
+        current_soft_mask = (current_weights > 0.0) & (current_weights < 1.0)
+        current_discard_mask = current_weights == 0.0
+
+        current_num_total = int(current_weights.numel())
+        current_num_selected = int(current_selected_mask.sum().item())
+        current_num_soft = int(current_soft_mask.sum().item())
+        current_num_discarded = int(current_discard_mask.sum().item())
+
+        current_selected_rate = current_num_selected / max(1, current_num_total)
+        current_soft_rate = current_num_soft / max(1, current_num_total)
+        current_discard_rate = current_num_discarded / max(1, current_num_total)
+
+        current_mean_weight = float(current_weights.mean().item())
+
+        semantic_selected_steps += current_num_selected
 
         # -------------------------
         # PPO update
@@ -983,22 +1004,135 @@ if __name__ == "__main__":
                 step,
             )
 
-        if args.semantic_enabled:
-            writer.add_scalar("semantic/current_keep_rate", float(keep_mask_step[b_mask].mean().item()), step)
-            writer.add_scalar("semantic/buffer_keep_rate", float(keep_mask_step[b_mask].mean().item()), step)
-            writer.add_scalar("semantic/step_keep_rate", float(semantic_kept) / max(1, semantic_total), step)
-            writer.add_scalar("semantic/num_kept_current", float(((keep_mask_step > 0.5) & b_mask).sum().item()), step)
-            writer.add_scalar("semantic/adv_keep_frac_target", float(args.adv_keep_frac), step)
-            writer.add_scalar("semantic/adv_score_mean", float(semantic_score[b_mask].mean().item()), step)
-            writer.add_scalar("semantic/adv_score_max", float(semantic_score[b_mask].max().item()), step)
-            if args.cf_advantage_enabled and cf_advantages_unnorm is not None:
-                writer.add_scalar("semantic/cf_score_norm_mean", float(cf_score[b_mask].mean().item()), step)
-                writer.add_scalar("semantic/td_score_norm_mean", float(td_score[b_mask].mean().item()), step)
-                writer.add_scalar("semantic/combined_score_mean", float(score[b_mask].mean().item()), step)
-                writer.add_scalar("semantic/combined_score_max", float(score[b_mask].max().item()), step)
+        if args.semantic_enabled and num_episodes_total % args.semantic_log_every == 0:
+            writer.add_scalar(
+                "semantic/selected_rate_current",
+                current_selected_rate,
+                step,
+            )
+
+            writer.add_scalar(
+                "semantic/soft_discard_rate_current",
+                current_soft_rate,
+                step,
+            )
+
+            writer.add_scalar(
+                "semantic/full_discard_rate_current",
+                current_discard_rate,
+                step,
+            )
+
+            writer.add_scalar(
+                "semantic/mean_actor_weight_current",
+                current_mean_weight,
+                step,
+            )
+
+            writer.add_scalar(
+                "semantic/num_selected_current",
+                current_num_selected,
+                step,
+            )
+
+            writer.add_scalar(
+                "semantic/num_soft_discarded_current",
+                current_num_soft,
+                step,
+            )
+
+            writer.add_scalar(
+                "semantic/num_fully_discarded_current",
+                current_num_discarded,
+                step,
+            )
+
+            writer.add_scalar(
+                "semantic/num_total_current",
+                current_num_total,
+                step,
+            )
+
+            writer.add_scalar(
+                "semantic/selected_rate_running",
+                float(semantic_selected_steps) / max(1, semantic_total_steps),
+                step,
+            )
+
+            writer.add_scalar(
+                "semantic/adv_keep_frac_target",
+                float(args.adv_keep_frac),
+                step,
+            )
+
+            writer.add_scalar(
+                "semantic/random_keep_frac_target",
+                float(args.random_keep_frac),
+                step,
+            )
+
+            writer.add_scalar(
+                "semantic/current_soft_discard_weight",
+                float(args.soft_discard_weight),
+                step,
+            )
+
+            writer.add_scalar(
+                "semantic/score_mean",
+                float(semantic_score[b_mask].mean().item()),
+                step,
+            )
+
+            writer.add_scalar(
+                "semantic/score_std",
+                float(semantic_score[b_mask].std().item()),
+                step,
+            )
+
+            writer.add_scalar(
+                "semantic/score_min",
+                float(semantic_score[b_mask].min().item()),
+                step,
+            )
+
+            writer.add_scalar(
+                "semantic/score_max",
+                float(semantic_score[b_mask].max().item()),
+                step,
+            )
 
             if score_threshold is not None:
-                writer.add_scalar("semantic/current_score_threshold", float(score_threshold), step)
+                writer.add_scalar(
+                    "semantic/current_score_threshold",
+                    float(score_threshold),
+                    step,
+                )
+
+            if args.cf_advantage_enabled and cf_advantages_unnorm is not None:
+
+                writer.add_scalar(
+                    "semantic/cf_score_norm_mean",
+                    float(cf_score[b_mask].mean().item()),
+                    step,
+                )
+
+                writer.add_scalar(
+                    "semantic/td_score_norm_mean",
+                    float(td_score[b_mask].mean().item()),
+                    step,
+                )
+
+                writer.add_scalar(
+                    "semantic/combined_score_mean",
+                    float(score[b_mask].mean().item()),
+                    step,
+                )
+
+                writer.add_scalar(
+                    "semantic/combined_score_max",
+                    float(score[b_mask].max().item()),
+                    step,
+                )
 
         # -------------------------
         # Eval

@@ -75,6 +75,13 @@ class Args:
     vmas_navigation_agent_radius: float = 0.1
     vmas_navigation_observe_all_goals: bool = False
     vmas_navigation_agents_with_same_goal: int = 1
+    
+    # -------------------------
+    # VMAS transport config
+    # -------------------------
+    vmas_n_packages: int = 1
+    vmas_package_width: float = 0.2
+    vmas_package_length: float = 0.2
 
     # PPO / MAPPO hyperparameters
     rollout_steps: int = 100
@@ -147,6 +154,8 @@ class Args:
     random_keep_frac: float = 0.1
     
     cf_advantage_enabled: bool = False
+    
+    heterogeneous_policy: bool = False
 
     # clustering
     cluster_enabled: bool = False
@@ -322,6 +331,75 @@ class Actor(nn.Module):
 
         return env_actions, log_probs, entropy
 
+
+class HeterogeneousActor(nn.Module):
+    def __init__(self, n_agents, input_dim, hidden_dim, num_layer, output_dim, activation_name="relu"):
+        super().__init__()
+        self.n_agents = int(n_agents)
+        self.actors = nn.ModuleList([
+            Actor(
+                input_dim=input_dim,
+                hidden_dim=hidden_dim,
+                num_layer=num_layer,
+                output_dim=output_dim,
+                activation_name=activation_name,
+            )
+            for _ in range(self.n_agents)
+        ])
+
+    def act(self, x, action_scale, action_bias, actions=None, deterministic=False, agent_indices=None):
+        if x.ndim == 3:
+            out_actions, out_log_probs, out_entropies = [], [], []
+
+            for i, actor_i in enumerate(self.actors):
+                a_i = None if actions is None else actions[:, i, :]
+                act_i, logp_i, ent_i = actor_i.act(
+                    x[:, i, :],
+                    action_scale=action_scale,
+                    action_bias=action_bias,
+                    actions=a_i,
+                    deterministic=deterministic,
+                )
+                out_actions.append(act_i)
+                out_log_probs.append(logp_i)
+                out_entropies.append(ent_i)
+
+            return (
+                torch.stack(out_actions, dim=1),
+                torch.stack(out_log_probs, dim=1),
+                torch.stack(out_entropies, dim=1),
+            )
+
+        if x.ndim == 2:
+            if agent_indices is None:
+                raise ValueError("agent_indices must be provided for flattened heterogeneous actor input.")
+
+            out_actions = torch.zeros((x.shape[0], self.actors[0].logstd_layer.shape[0]), device=x.device)
+            out_log_probs = torch.zeros((x.shape[0],), device=x.device)
+            out_entropies = torch.zeros((x.shape[0],), device=x.device)
+
+            for i, actor_i in enumerate(self.actors):
+                mask = agent_indices == i
+                if not torch.any(mask):
+                    continue
+
+                a_i = None if actions is None else actions[mask]
+                act_i, logp_i, ent_i = actor_i.act(
+                    x[mask],
+                    action_scale=action_scale,
+                    action_bias=action_bias,
+                    actions=a_i,
+                    deterministic=deterministic,
+                )
+
+                out_actions[mask] = act_i
+                out_log_probs[mask] = logp_i
+                out_entropies[mask] = ent_i
+
+            return out_actions, out_log_probs, out_entropies
+
+        raise ValueError(f"Unexpected actor input shape: {x.shape}")
+    
 
 class Critic(nn.Module):
     def __init__(self, input_dim, hidden_dim, num_layer, activation_name="relu") -> None:
@@ -599,6 +677,16 @@ def _build_vmas_kwargs(args: Args, num_envs: int) -> dict:
                 "spawn_same_pos": bool(args.vmas_sampling_spawn_same_pos),
             }
         )
+        
+    elif args.env_name == "transport":
+        kwargs.update(
+            {
+                "n_packages": int(args.vmas_n_packages),
+                "package_mass": float(args.vmas_package_mass),
+                "package_width": float(args.vmas_package_width),
+                "package_length": float(args.vmas_package_length),
+            }
+        )
 
     elif args.env_name == "navigation":
         kwargs.update(
@@ -707,13 +795,23 @@ if __name__ == "__main__":
     action_scale = (act_high_t - act_low_t) / 2.0
     action_bias = (act_high_t + act_low_t) / 2.0
 
-    actor = Actor(
-        input_dim=env.get_obs_size(),
-        hidden_dim=args.actor_hidden_dim,
-        num_layer=args.actor_num_layers,
-        output_dim=env.get_action_size(),
-        activation_name=args.activation,
-    ).to(device)
+    if args.heterogeneous_policy:
+        actor = HeterogeneousActor(
+            n_agents=env.n_agents,
+            input_dim=env.get_obs_size(),
+            hidden_dim=args.actor_hidden_dim,
+            num_layer=args.actor_num_layers,
+            output_dim=env.get_action_size(),
+            activation_name=args.activation,
+        ).to(device)
+    else:
+        actor = Actor(
+            input_dim=env.get_obs_size(),
+            hidden_dim=args.actor_hidden_dim,
+            num_layer=args.actor_num_layers,
+            output_dim=env.get_action_size(),
+            activation_name=args.activation,
+        ).to(device)
 
     critic = Critic(
         input_dim=env.get_state_size(),
@@ -1100,10 +1198,29 @@ if __name__ == "__main__":
                         last_num_clusters = float(len(clusters))
                         last_mean_policy_dist = float(cstats["mean_pairwise_policy_dist"])
 
+        # -------------------------
+        # Semantic logging statistics
+        # -------------------------
         semantic_total_steps += int(rb.ptr * env.num_envs)
-        # For logging, count a transition as "kept" if its weight is above the
-        # soft discard weight (i.e. it was not downweighted).
-        semantic_kept_steps += int((rb.keep_mask[:rb.ptr] > 0.5).sum().item())
+
+        current_weights = rb.keep_mask[:rb.ptr]
+
+        # Selected means full-weight samples, not soft-discarded samples.
+        current_selected_mask = current_weights == 1.0
+        current_soft_mask = (current_weights > 0.0) & (current_weights < 1.0)
+        current_discard_mask = current_weights == 0.0
+
+        current_num_total = int(current_weights.numel())
+        current_num_selected = int(current_selected_mask.sum().item())
+        current_num_soft = int(current_soft_mask.sum().item())
+        current_num_discarded = int(current_discard_mask.sum().item())
+
+        current_selected_rate = current_num_selected / max(1, current_num_total)
+        current_soft_rate = current_num_soft / max(1, current_num_total)
+        current_discard_rate = current_num_discarded / max(1, current_num_total)
+        current_mean_weight = float(current_weights.mean().item())
+
+        semantic_kept_steps += current_num_selected
 
         # -------------------------
         # Flatten for PPO update
@@ -1157,12 +1274,23 @@ if __name__ == "__main__":
                 mb_states = b_states[idx_step]
                 mb_returns = b_returns[idx_step]
 
-                _, current_logprob, current_entropy = actor.act(
-                    x=mb_obs,
-                    action_scale=action_scale,
-                    action_bias=action_bias,
-                    actions=mb_actions,
-                )
+                if args.heterogeneous_policy:
+                    mb_agent_indices = idx_agent % N
+
+                    _, current_logprob, current_entropy = actor.act(
+                        x=mb_obs,
+                        action_scale=action_scale,
+                        action_bias=action_bias,
+                        actions=mb_actions,
+                        agent_indices=mb_agent_indices,
+                    )
+                else:
+                    _, current_logprob, current_entropy = actor.act(
+                        x=mb_obs,
+                        action_scale=action_scale,
+                        action_bias=action_bias,
+                        actions=mb_actions,
+                    )
 
                 log_ratio = current_logprob - mb_old_log_probs
                 ratio = torch.exp(log_ratio)
@@ -1268,51 +1396,40 @@ if __name__ == "__main__":
             completed_ep_lengths.clear()
 
         if args.semantic_enabled and num_episode % args.semantic_log_every == 0:
+            writer.add_scalar("semantic/selected_rate_current", current_selected_rate, step)
+            writer.add_scalar("semantic/soft_discard_rate_current", current_soft_rate, step)
+            writer.add_scalar("semantic/full_discard_rate_current", current_discard_rate, step)
+            writer.add_scalar("semantic/mean_actor_weight_current", current_mean_weight, step)
+
+            writer.add_scalar("semantic/num_selected_current", current_num_selected, step)
+            writer.add_scalar("semantic/num_soft_discarded_current", current_num_soft, step)
+            writer.add_scalar("semantic/num_fully_discarded_current", current_num_discarded, step)
+            writer.add_scalar("semantic/num_total_current", current_num_total, step)
+
             writer.add_scalar(
-                "semantic/buffer_keep_rate",
-                float(rb.keep_mask[:rb.ptr].mean().item()) if rb.ptr > 0 else 1.0,
-                step,
-            )
-            writer.add_scalar(
-                "semantic/step_keep_rate",
+                "semantic/selected_rate_running",
                 float(semantic_kept_steps) / max(1, semantic_total_steps),
                 step,
             )
-            writer.add_scalar("semantic/adv_keep_frac_target", float(args.adv_keep_frac), step)
 
-            if args.semantic_enabled and args.semantic_mode == "advantage":
-                writer.add_scalar(
-                    "semantic/adv_score_mean",
-                    float(rb.semantic_score[:rb.ptr].mean().item()) if rb.ptr > 0 else 0.0,
-                    step,
-                )
-                writer.add_scalar(
-                    "semantic/adv_score_max",
-                    float(rb.semantic_score[:rb.ptr].max().item()) if rb.ptr > 0 else 0.0,
-                    step,
-                )
-                
-            writer.add_scalar("semantic/current_keep_rate", float(rb.keep_mask[:rb.ptr].mean().item()), step)
-            writer.add_scalar("semantic/num_kept_current", float(rb.keep_mask[:rb.ptr].sum().item()), step)
-            
-            writer.add_scalar(
-                "semantic/current_soft_discard_weight",
-                float(current_soft_discard_weight),
-                step,
-            )
+            writer.add_scalar("semantic/adv_keep_frac_target", float(args.adv_keep_frac), step)
+            writer.add_scalar("semantic/random_keep_frac_target", float(args.random_keep_frac), step)
+            writer.add_scalar("semantic/current_soft_discard_weight", float(current_soft_discard_weight), step)
+
+            if args.semantic_mode == "advantage":
+                writer.add_scalar("semantic/score_mean", float(rb.semantic_score[:rb.ptr].mean().item()), step)
+                writer.add_scalar("semantic/score_std", float(rb.semantic_score[:rb.ptr].std().item()), step)
+                writer.add_scalar("semantic/score_min", float(rb.semantic_score[:rb.ptr].min().item()), step)
+                writer.add_scalar("semantic/score_max", float(rb.semantic_score[:rb.ptr].max().item()), step)
 
             if score_threshold is not None:
                 writer.add_scalar("semantic/current_score_threshold", float(score_threshold), step)
-                
-            writer.add_scalar("semantic/cf_score_norm_mean", cf_score.mean().item(), step)
-            writer.add_scalar("semantic/td_score_norm_mean", td_score.mean().item(), step)
-            writer.add_scalar("semantic/combined_score_mean", combined_score.mean().item(), step)
-            writer.add_scalar("semantic/combined_score_max", combined_score.max().item(), step)
 
-            if args.cluster_enabled:
-                writer.add_scalar("cluster/entropy", float(last_cluster_entropy), step)
-                writer.add_scalar("cluster/num_clusters", float(last_num_clusters), step)
-                writer.add_scalar("cluster/mean_pairwise_policy_dist", float(last_mean_policy_dist), step)
+            if args.cf_advantage_enabled and cf_advantages_unnorm is not None:
+                writer.add_scalar("semantic/cf_score_norm_mean", cf_score.mean().item(), step)
+                writer.add_scalar("semantic/td_score_norm_mean", td_score.mean().item(), step)
+                writer.add_scalar("semantic/combined_score_mean", combined_score.mean().item(), step)
+                writer.add_scalar("semantic/combined_score_max", combined_score.max().item(), step)
 
         if step >= next_eval_step:
             video_root = Path(args.eval_video_dir) / run_name / f"step_{step}"
